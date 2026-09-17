@@ -132,6 +132,10 @@ service)
   <key>WorkingDirectory</key><string>$DIR</string>
   <key>EnvironmentVariables</key><dict>
     <key>PRISM_EFFORT</key><string>${PRISM_EFFORT:-medium}</string>
+    <!-- launchd starts with a bare PATH; auto-refresh needs to find chrome-use -->
+    <key>PATH</key><string>$HOME/.npm-global/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>FREE_ASTRA_HOME</key><string>$STATE</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

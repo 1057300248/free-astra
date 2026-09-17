@@ -12,7 +12,14 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="${FREE_ASTRA_HOME:-$HOME/.free-astra}"
 SESSION="${PRISM_SESSION:-$STATE/session.json}"
 PROJECT_URL="${PRISM_PROJECT_URL:-}"
-S=(chrome-use --session prism)
+CU="$(command -v chrome-use || true)"
+for c in "$HOME/.npm-global/bin/chrome-use" "$HOME/.local/bin/chrome-use" \
+         /opt/homebrew/bin/chrome-use /usr/local/bin/chrome-use; do
+  [ -n "$CU" ] && break
+  [ -x "$c" ] && CU="$c"
+done
+[ -n "$CU" ] || { echo "chrome-use not found on PATH or in the usual places" >&2; exit 1; }
+S=("$CU" --session prism)
 
 if [ -z "$PROJECT_URL" ] && [ -f "$SESSION" ]; then
   PROJECT_URL="$(python3 -c "
@@ -21,7 +28,7 @@ try: print(json.load(open('$SESSION')).get('project_url',''))
 except Exception: print('')")"
 fi
 [ -n "$PROJECT_URL" ] || { echo "set PRISM_PROJECT_URL to your Prism project URL" >&2; exit 1; }
-command -v chrome-use >/dev/null || {
+[ -n "$CU" ] || {
   echo "chrome-use not found. Install it:" >&2
   echo "  curl -fsSL https://raw.githubusercontent.com/leeguooooo/chrome-use/main/install.sh | sh" >&2
   echo "or capture the session by hand: python3 scripts/from_curl.py" >&2

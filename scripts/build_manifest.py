@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Build the model manifest free-astra serves to Codex.
 
-The three prism entries are cloned from your own account's Codex model catalog and
-changed in only the ways that matter, so they stay consistent with whatever OpenAI
-ships. Nothing here is committed to the repo: the upstream entries carry OpenAI's
-own instruction text, which is theirs, not ours.
+The prism entries are cloned from a model already in your own Codex catalog, then
+changed only where it matters (slug, tool_mode), so they stay consistent with
+whatever OpenAI ships. Which model you clone from does not gate what Prism will
+answer with - Prism decides that from the `model` field we send it - so a free
+account without Astra in its Codex catalog still works fine.
+
+Nothing here is committed to the repo: these entries carry OpenAI's own
+instruction text, which is theirs, not ours.
 """
 import json, os, sys, urllib.request
 
 STATE = os.environ.get("FREE_ASTRA_HOME", os.path.expanduser("~/.free-astra"))
 OUT = os.path.join(STATE, "models.json")
 UPSTREAM = "https://chatgpt.com/backend-api/codex"
-CLONE = [("gpt-6-astra", "prism-astra", "Prism Astra"),
-         ("gpt-5.6-sol", "prism-sol", "Prism Sol"),
-         ("gpt-5.6-terra", "prism-terra", "Prism Terra")]
+TARGETS = [("prism-astra", "Prism Astra"),
+           ("prism-sol", "Prism Sol"),
+           ("prism-terra", "Prism Terra")]
+# Preferred templates, best first. Any recent model works; we only need a valid
+# ModelInfo shell to hang our slug and tool_mode on.
+TEMPLATES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
 
 
 def official():
@@ -36,12 +43,12 @@ def official():
 
 def main():
     have = official()
-    missing = [s for s, _, _ in CLONE if s not in have]
-    if missing:
-        sys.exit("your account has no access to %s - free-astra can only expose "
-                 "models you already have" % ", ".join(missing))
+    src = next((t for t in TEMPLATES if t in have), None) or next(iter(have), None)
+    if not src:
+        sys.exit("your Codex catalog came back empty - try `codex login` again")
+    print("  cloning model metadata from %s" % src)
     out = []
-    for src, slug, label in CLONE:
+    for slug, label in TARGETS:
         m = dict(have[src])
         m["slug"] = slug
         m["display_name"] = label

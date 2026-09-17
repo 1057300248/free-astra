@@ -1,7 +1,10 @@
 # free-astra
 
-Use the models inside **prism.openai.com** — OpenAI's online LaTeX editor — from your
-own local Codex, on a quota that is separate from your Codex/ChatGPT limits.
+Use **GPT-6-Astra** from your own local Codex, for free.
+
+It comes from **prism.openai.com**, OpenAI's online LaTeX editor, whose AI panel
+runs the frontier models. No paid plan, no API key, no credit card: sign in to
+Prism in your browser and free-astra bridges that session into Codex.
 
 ```bash
 git clone https://github.com/Zhao73/free-astra && cd free-astra
@@ -30,15 +33,19 @@ It is a real agent, not a chat box: it runs commands and edits files on your
 machine. Verified by handing it a Python file with two bugs, which it fixed and
 re-ran, output confirmed on disk.
 
-**Read this before you get excited:** Codex already supports `gpt-6-astra`,
-`gpt-5.6-sol` and `gpt-5.6-terra` natively, with real streaming and real token
-accounting. Use those by default. free-astra earns its keep for one reason: Prism
-counts against a **different quota**, so it is there when your Codex limit is gone.
+**Honest notes.** If your ChatGPT plan already gives you these models in Codex,
+use them natively - you get real streaming and real token accounting, and this
+adapter gives you neither. free-astra is for everyone else: Prism asks for a
+signed-in browser session and nothing more, so the models are reachable without a
+paid plan. Prism still applies its own daily and monthly usage limits, and those
+are separate from your Codex ones.
 
 ## Requirements
 
-- A ChatGPT account that can open a project on prism.openai.com
-- `codex` CLI, signed in (`codex login`)
+- A ChatGPT account signed in at prism.openai.com. A free one is enough - Prism
+  reports `entitlements: not_required`.
+- `codex` CLI, signed in (`codex login`). Your Codex catalog does not need to
+  contain Astra; free-astra clones whichever model you do have as a template.
 - Python 3.9+, and `pip install zstandard` (Codex compresses request bodies)
 - macOS or Linux. The keep-alive service is macOS-only; elsewhere run `freeastra.py`
   yourself.
@@ -127,7 +134,7 @@ to ask (CI, pipes, the background service). Nothing is starred without you typin
 FREE_ASTRA_NO_PROMPT=1 ./install.sh
 ```
 
-If it saved you some quota, a star genuinely helps other people find it.
+If it saved you something, a star genuinely helps other people find it.
 
 ## Fair warning
 
