@@ -1,0 +1,8 @@
+# never commit a session: it contains your cookies and sandbox token
+session.json
+models.json
+*.log
+__pycache__/
+.refresh.har
+.cookies.tmp
+.meta.tmp
