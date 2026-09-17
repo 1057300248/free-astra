@@ -30,6 +30,9 @@ DEFAULT_EFFORT = os.environ.get("PRISM_EFFORT", "medium")
 # Total budget for one answer. Without this a cold sandbox makes the adapter block
 # for minutes and Codex just sits on "thinking" with nothing to show the user.
 BUDGET = float(os.environ.get("PRISM_TIMEOUT", "240"))
+# Tool output piles up fast (a skills scan alone ran to 80 KB) and a prompt that
+# size makes Prism time out. Keep the newest history and elide the rest.
+MAX_TRANSCRIPT = int(os.environ.get("PRISM_MAX_TRANSCRIPT", "24000"))
 CHATGPT_UPSTREAM = "https://chatgpt.com/backend-api/codex"
 OPENCODEX_UPSTREAM = "http://127.0.0.1:10100/v1"
 
@@ -94,12 +97,18 @@ Nothing else. Start your reply with { .
 
 AGENT_PREAMBLE = ""
 
-CONTEXT = re.compile(r"<(environment_context|user_instructions)\b|\bcwd\b|working directory")
+ENV_BLOCK = re.compile(r"<environment_context>.*?</environment_context>", re.S)
+CWD_LINE = re.compile(r"^.{0,40}(cwd|current working directory)\s*[:=].*$",
+                      re.I | re.M)
 NOISE = re.compile(r"<(recommended_plugins|plugin_instructions|skills_instructions|"
                    r"apps_instructions)\b")
 
 _lock = threading.Lock()
 _refresh_lock = threading.Lock()
+# One Prism sandbox runs one Codex turn at a time. Codex happily fires several
+# requests at once (the turn, a title, a summary), and the extra ones come back
+# 400. Serialise them instead of letting them collide.
+_turn_lock = threading.Semaphore(int(os.environ.get("PRISM_CONCURRENCY", "1")))
 _last_refresh = [0.0]
 
 
@@ -111,24 +120,27 @@ def try_refresh(reason):
     script = os.path.join(HERE, "scripts", "refresh-session.sh")
     if not os.path.exists(script):
         return False
+    waited = _refresh_lock.locked()
     with _refresh_lock:
-        if time.time() - _last_refresh[0] < 180:      # cooldown, refresh is slow
-            return False
+        if waited and time.time() - _last_refresh[0] < 180:
+            return True                # someone just refreshed while we queued; use it
+        if time.time() - _last_refresh[0] < 30:
+            return False               # genuinely just tried and it did not help
         _last_refresh[0] = time.time()
-        sys.stderr.write("[free-astra] session looks stale (%s) - refreshing\n" % reason)
+        sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "session looks stale (%s) - refreshing\n" % reason)
         try:
             import subprocess
             r = subprocess.run(["bash", script], capture_output=True, timeout=300,
                                env=dict(os.environ, PRISM_SESSION=SESSION_FILE))
             if r.returncode != 0:
-                sys.stderr.write("[free-astra] refresh failed: %s\n"
+                sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh failed: %s\n"
                                  % (r.stderr or b"")[-300:].decode("utf-8", "replace"))
                 return False
         except Exception as e:
-            sys.stderr.write("[free-astra] refresh error: %s\n" % e)
+            sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh error: %s\n" % e)
             return False
         load_session()
-        sys.stderr.write("[free-astra] session refreshed\n")
+        sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "session refreshed\n")
         return True
 _session = {"cookie": "", "sandbox_url": "", "sandbox_token": "",
             "project_id": None, "user_id": None, "upstream": None}
@@ -247,6 +259,43 @@ def tool_specs(tools):
     return out
 
 
+def env_context(sys_parts):
+    """Just the shell environment, nothing else.
+
+    Matching loosely on "cwd" used to pull in 4 KB of whatever message happened to
+    contain the word - desktop-app context, memory from other projects - and the
+    model would happily go work on that instead of the task.
+    """
+    out = []
+    for c in sys_parts:
+        if not c:
+            continue
+        out += ENV_BLOCK.findall(c)
+        if not out:
+            out += [m.group(0).strip() for m in CWD_LINE.finditer(c)][:3]
+    return "\n".join(out)[:1500]
+
+
+def clamp_transcript(entries, budget=None):
+    """Keep the most recent entries that fit, oldest first, noting what was cut."""
+    budget = MAX_TRANSCRIPT if budget is None else budget
+    if not entries:
+        return []
+    kept, total = [], 0
+    for e in reversed(entries):
+        if total + len(e) > budget:
+            break
+        kept.append(e)
+        total += len(e)
+    kept.reverse()
+    if not kept:                        # a single entry larger than the whole budget
+        return ["...(truncated)...\n" + entries[-1][-budget:]]
+    dropped = len(entries) - len(kept)
+    if dropped:
+        kept.insert(0, "...(%d earlier steps omitted)..." % dropped)
+    return kept
+
+
 def assemble(sys_parts, convo, tools):
     """Fold everything into one system + one user message.
 
@@ -266,15 +315,16 @@ def assemble(sys_parts, convo, tools):
     spec = "\n".join("- %s\n    params: %s\n    %s" % (n, json.dumps(p, ensure_ascii=False)[:700], d)
                       for n, p, d in specs)
     system = TOOL_PROTOCOL % spec
-    ctx = "\n\n".join(c for c in sys_parts if CONTEXT.search(c or ""))
+    ctx = env_context(sys_parts)
     if ctx:
-        system += "\n\nEnvironment the executor runs in (for path and shell decisions):\n" + ctx[:4000]
+        system += "\n\nEnvironment the executor runs in (for path and shell decisions):\n" + ctx
 
     # Tool results arrive AFTER the last user message, so the transcript is
     # everything except that one line - not just what came before it.
     last_i = max((k for k, c in enumerate(convo) if c.startswith("[user]\n")), default=None)
     task = convo[last_i][len("[user]\n"):].strip() if last_i is not None else ""
     rest = (convo[:last_i] + convo[last_i + 1:]) if last_i is not None else list(convo)
+    rest = clamp_transcript(rest)
     transcript = "\n\n".join(rest) if rest else "(empty - the executor has run nothing yet)"
     user = ("TASK:\n%s\n\nTRANSCRIPT SO FAR:\n%s" % (task or "(none)", transcript)
             + TOOL_REMINDER % ", ".join(n for n, _, _ in specs))
@@ -397,6 +447,22 @@ def parse_tool_call(text):
                          "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
+def keepalive_loop():
+    """The sandbox goes cold when idle and then every call fails for a minute or
+    two while we notice and re-capture. Cheaper to poke it on a timer."""
+    period = float(os.environ.get("PRISM_KEEPALIVE", "600"))
+    if period <= 0:
+        return
+    while True:
+        time.sleep(period)
+        try:
+            call_prism(MODELS[0], "", "ping", "low", retries=1)
+            sys.stderr.write("[free-astra %s] keepalive ok\n" % time.strftime("%H:%M:%S"))
+        except Exception as e:
+            sys.stderr.write("[free-astra %s] keepalive failed: %s\n"
+                             % (time.strftime("%H:%M:%S"), str(e)[:160]))
+
+
 def _prism_attempt(inp, model, effort, deadline, retries):
     """One pass at getting an answer. Returns (text, None) or (None, reason)."""
     last = ""
@@ -411,20 +477,42 @@ def _prism_attempt(inp, model, effort, deadline, retries):
             meta["userId"] = _session["user_id"]
 
         st, s = post("/api/llm/response_with_tools_start", {"input": inp, "metadata": meta},
-                     timeout=min(deadline - time.time(), 120))
+                     timeout=max(60, min(deadline - time.time(), 180)))
         if st != 200 or "request_id" not in s:
-            last = "start http=%s %s" % (st, json.dumps(s)[:160])
+            last = "start http=%s %s" % (st, json.dumps(s)[:300])
+            sys.stderr.write("[free-astra %s] start failed http=%s body=%s\n"
+                             % (time.strftime("%H:%M:%S"), st, json.dumps(s)[:400]))
             if st in (400, 401, 403):
                 return None, last                  # auth-shaped: retrying cannot help
             time.sleep(min(3, max(0, deadline - time.time())))
             continue
 
-        p = {"request_id": s["request_id"], "turn_state": s.get("turn_state")}
+        # `start` can finish the turn outright, and then it carries no turn_state.
+        # Polling with a null one is rejected with "turn_state is required", which
+        # used to look like an expired session and trigger a pointless refresh.
+        if s.get("status") in ("completed", "error", "failed") or not s.get("turn_state"):
+            rs = s.get("response") or {}
+            if rs.get("status") == "success":
+                out = rs.get("payload", {}).get("output") or []
+                return "".join(c.get("text", "") for o in out
+                               if o.get("type") == "message"
+                               for c in o.get("content", [])), None
+            pay = rs.get("payload") or {}
+            last = ("%s: %s" % (pay.get("reason"), pay.get("message", "")))[:300] \
+                   or "start returned %s with no turn_state" % s.get("status")
+            if pay.get("reason") in ("sandbox_reconnecting", "unknown") or pay.get("httpStatus") == 504:
+                mint_sandbox()
+            time.sleep(min(2, max(0, deadline - time.time())))
+            continue
+
+        p = {"request_id": s["request_id"], "turn_state": s["turn_state"]}
         while time.time() < deadline:
             st, j = post("/api/llm/response_with_tools_status", p,
                          timeout=min(max(deadline - time.time(), 5), 60))
             if st != 200:
-                return None, "status http=%s" % st  # same story on the poll side
+                sys.stderr.write("[free-astra %s] poll failed http=%s body=%s\n"
+                                 % (time.strftime("%H:%M:%S"), st, json.dumps(j)[:400]))
+                return None, "status http=%s %s" % (st, json.dumps(j)[:300])
             if j.get("turn_state"):
                 p["turn_state"] = j["turn_state"]
             if j.get("status") in ("completed", "error", "failed"):
@@ -447,6 +535,16 @@ def _prism_attempt(inp, model, effort, deadline, retries):
 
 
 def call_prism(model, system, user, effort, retries=3):
+    waited = time.time()
+    if not _turn_lock.acquire(timeout=BUDGET):
+        raise RuntimeError("timed out waiting for the Prism sandbox to free up")
+    try:
+        return _call_prism_locked(model, system, user, effort, retries, waited)
+    finally:
+        _turn_lock.release()
+
+
+def _call_prism_locked(model, system, user, effort, retries, queued_at):
     inp = []
     if system:
         inp.append({"type": "message", "role": "system",
@@ -454,13 +552,17 @@ def call_prism(model, system, user, effort, retries=3):
     inp.append({"type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": user}]})
 
-    text, why = _prism_attempt(inp, model, effort, time.time() + BUDGET, retries)
+    # the queue wait already spent part of the caller's patience
+    budget = max(30.0, BUDGET - (time.time() - queued_at))
+    text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
     if text is not None:
         return text
     # Any terminal failure here usually means stale cookies or a dead sandbox, and
     # both the start and the poll side report it. Re-capture once, then try again.
+    if "turn_state is required" in (why or ""):
+        raise RuntimeError(why)                 # our bug, not a session problem
     if try_refresh(why):
-        text, why = _prism_attempt(inp, model, effort, time.time() + BUDGET, retries)
+        text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
         if text is not None:
             return text
     raise RuntimeError(
@@ -471,7 +573,8 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *a):
-        sys.stderr.write("[free-astra] %s\n" % (fmt % a))
+        sys.stderr.write("[free-astra %s] %s\n"
+                         % (time.strftime("%H:%M:%S"), fmt % a))
 
     def _send(self, code, obj, ctype="application/json"):
         body = (obj if isinstance(obj, bytes) else json.dumps(obj).encode())
@@ -505,7 +608,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:                                        # keep every native model
                     out = list(upstream_models().get("models") or [])
                 except Exception as e:
-                    sys.stderr.write("[free-astra] upstream models failed: %s\n" % e)
+                    sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "upstream models failed: %s\n" % e)
                 for m in out + mine:
                     m["prefer_websockets"] = False           # we speak plain HTTP only
                 return self._send(200, {"models": out + mine})
@@ -640,6 +743,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             text = call_prism(model, system, user, effort)
         except Exception as e:
+            sys.stderr.write("[free-astra %s] 502 model=%s sys=%dB user=%dB: %s\n"
+                             % (time.strftime("%H:%M:%S"), model, len(system), len(user), str(e)[:300]))
             return self._send(502, {"error": {"message": str(e), "type": "prism_upstream"}})
 
         extra = additional_tool_specs(req.get("input")) if is_resp else []
@@ -653,7 +758,8 @@ class Handler(BaseHTTPRequestHandler):
             done = parse_done(text)
             if done is not None:
                 text = done
-        sys.stderr.write("[free-astra] %s tools=%d sys=%dB user=%dB -> %s | %s\n" % (
+        sys.stderr.write("[free-astra %s] %s tools=%d sys=%dB user=%dB -> %s | %s\n" % (
+            time.strftime("%H:%M:%S"),
             "ns" if extra else "top", len(tools), len(system), len(user),
             "TOOLCALL:" + tc["function"]["name"] if tc else "TEXT",
             repr(text[:160])))
@@ -736,6 +842,20 @@ def demo():
     assert parse_tool_call('{"tool_call":{"name":"x","arguments":"{\\"a\\":1}"}}')
     assert parse_done('{"done":"ok"} trailing prose') == "ok"
 
+    # a long unrelated message that merely mentions cwd must not leak in
+    noise = "## Memory\n" + "notes about another project " * 400 + "\ncwd stuff"
+    assert env_context([noise]) == "" or "another project" not in env_context([noise])
+    assert env_context(["<environment_context>cwd=/srv</environment_context>"]) \
+           == "<environment_context>cwd=/srv</environment_context>"
+
+    big = ["step %d %s" % (i, "x" * 500) for i in range(100)]
+    clamped = clamp_transcript(big, budget=2000)
+    assert sum(len(c) for c in clamped) < 3000
+    assert "earlier steps omitted" in clamped[0] and clamped[-1] == big[-1]
+    assert clamp_transcript([], budget=100) == []
+    only = clamp_transcript(["y" * 5000], budget=1000)
+    assert only[0].startswith("...(truncated)...") and len(only[0]) < 1200
+
     # code mode: Codex ships tools inside an additional_tools item, entry point `exec`
     at = [{"type": "additional_tools", "role": "developer", "tools": [
               {"type": "namespace", "name": "functions", "tools": [
@@ -766,4 +886,5 @@ if __name__ == "__main__":
     print("free-astra on http://127.0.0.1:%d/v1  models=%s  effort=%s"
           % (PORT, ",".join(MODELS), DEFAULT_EFFORT))
     globals()["UPSTREAM"] = UPSTREAM
+    threading.Thread(target=keepalive_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
