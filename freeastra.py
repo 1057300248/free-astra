@@ -80,6 +80,9 @@ Shell guidance:
 - To read a file use `cat`, to search use `rg`. Verify with `cat` after writing.
 - A command failing does not mean the workspace is read-only. Diagnose the actual
   error text before concluding anything about permissions.
+- File paths in arguments are paths on the EXECUTOR's machine, shown above. Never
+  guess one, and never pass a path you have not seen in the transcript.
+- When a schema says two parameters are mutually exclusive, send only one.
 
 Emit exactly one of:
   {"tool_call":{"name":"<action>","arguments":{...}}}
@@ -97,7 +100,10 @@ Nothing else. Start your reply with { .
 
 AGENT_PREAMBLE = ""
 
-ENV_BLOCK = re.compile(r"<environment_context>.*?</environment_context>", re.S)
+# Codex puts the working directory in <cwd>/<filesystem> tags, inside the same
+# user message as the plugin list we drop as noise - so pull these out first.
+ENV_BLOCK = re.compile(
+    r"<(environment_context|cwd|filesystem)>.*?</\1>", re.S)
 CWD_LINE = re.compile(r"^.{0,40}(cwd|current working directory)\s*[:=].*$",
                       re.I | re.M)
 NOISE = re.compile(r"<(recommended_plugins|plugin_instructions|skills_instructions|"
@@ -269,7 +275,7 @@ def tool_specs(tools):
     return out
 
 
-def env_context(sys_parts):
+def env_context(parts):
     """Just the shell environment, nothing else.
 
     Matching loosely on "cwd" used to pull in 4 KB of whatever message happened to
@@ -277,13 +283,19 @@ def env_context(sys_parts):
     model would happily go work on that instead of the task.
     """
     out = []
-    for c in sys_parts:
+    for c in parts:
         if not c:
             continue
-        out += ENV_BLOCK.findall(c)
-        if not out:
-            out += [m.group(0).strip() for m in CWD_LINE.finditer(c)][:3]
-    return "\n".join(out)[:1500]
+        out += [m.group(0) for m in ENV_BLOCK.finditer(c)]
+    if not out:
+        for c in parts:
+            out += [m.group(0).strip() for m in CWD_LINE.finditer(c or "")][:3]
+    seen, uniq = set(), []
+    for o in out:
+        if o not in seen:
+            seen.add(o)
+            uniq.append(o)
+    return "\n".join(uniq)[:1500]
 
 
 def clamp_transcript(entries, budget=None):
@@ -306,7 +318,7 @@ def clamp_transcript(entries, budget=None):
     return kept
 
 
-def assemble(sys_parts, convo, tools):
+def assemble(sys_parts, convo, tools, env_parts=None):
     """Fold everything into one system + one user message.
 
     Upstream keeps only the last user message, so the transcript has to travel
@@ -325,9 +337,10 @@ def assemble(sys_parts, convo, tools):
     spec = "\n".join("- %s\n    params: %s\n    %s" % (n, json.dumps(p, ensure_ascii=False)[:700], d)
                       for n, p, d in specs)
     system = TOOL_PROTOCOL % spec
-    ctx = env_context(sys_parts)
+    ctx = env_context(env_parts if env_parts is not None else sys_parts)
     if ctx:
-        system += "\n\nEnvironment the executor runs in (for path and shell decisions):\n" + ctx
+        system += ("\n\nThe executor runs here. Use these real paths - never invent a "
+                   "sandbox path like /codex_workspace/...:\n" + ctx)
 
     # Tool results arrive AFTER the last user message, so the transcript is
     # everything except that one line - not just what came before it.
@@ -366,9 +379,10 @@ def flatten(messages, tools):
 
 def flatten_responses(items, instructions, tools):
     """Responses shape - what Codex sends."""
-    sys_parts, convo = [], []
+    sys_parts, convo, env_parts = [], [], []
     if instructions:
         sys_parts.append(instructions)
+        env_parts.append(instructions)
     for it in items or []:
         if isinstance(it, str):
             convo.append("[user]\n" + it)
@@ -396,6 +410,7 @@ def flatten_responses(items, instructions, tools):
             if isinstance(c, list):
                 c = "".join(x.get("text", "") for x in c if isinstance(x, dict))
             c = c or ""
+            env_parts.append(c)
             if role in ("developer", "system"):
                 sys_parts.append(c)
             elif role == "user" and NOISE.match(c.lstrip()):
@@ -407,7 +422,7 @@ def flatten_responses(items, instructions, tools):
     if extra and not tool_specs(tools):
         tools = [{"type": "function", "name": n, "parameters": p, "description": d}
                  for _, n, p, d in extra]
-    return assemble(sys_parts, convo, tools)
+    return assemble(sys_parts, convo, tools, env_parts)
 
 
 def _strip_fence(text):
@@ -608,6 +623,26 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[free-astra %s] %s\n"
                          % (time.strftime("%H:%M:%S"), fmt % a))
 
+    def _sse_start(self):
+        """HTTP/1.1 needs explicit framing. Without Content-Length or
+        Transfer-Encoding the client cannot tell where the body ends and reports
+        "stream disconnected before completion: error decoding response body"."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _sse(self, payload):
+        data = payload if isinstance(payload, bytes) else payload.encode()
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def _sse_end(self):
+        self._sse(b"data: [DONE]\n\n")
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
     def _send(self, code, obj, ctype="application/json"):
         body = (obj if isinstance(obj, bytes) else json.dumps(obj).encode())
         self.send_response(code)
@@ -651,33 +686,58 @@ class Handler(BaseHTTPRequestHandler):
             # Codex probes for a websocket endpoint. 404 makes it retry five times;
             # 426 tells it plainly there is none so it drops straight to HTTP.
             return self._send(426, {"error": "websocket transport not supported"})
-        self._send(404, {"error": "not found"})
+        self._passthrough(method="GET")
 
-    def _passthrough(self, raw_body):
-        """Not a Prism model - forward it to the real Codex backend verbatim."""
+    # headers that describe OUR hop, not the payload, so they must not be copied
+    HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
+           "upgrade", "proxy-authorization", "proxy-authenticate", "content-length"}
+
+    def _passthrough(self, raw_body=None, method="POST"):
+        """Anything we do not own - forward it to the real backend verbatim.
+
+        We are the single front door for Codex, so this has to cover every route
+        it uses, not just chat: image generation calls /v1/images/generations and
+        /v1/images/edits, and a 404 there breaks imagegen with a local reference
+        image.
+        """
         skip = {"host", "content-length", "connection", "accept-encoding"}
         headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
         url = UPSTREAM + self.path.split("/v1", 1)[-1]
-        req = urllib.request.Request(url, data=raw_body, method="POST", headers=headers)
+        req = urllib.request.Request(url, data=raw_body, method=method, headers=headers)
         try:
             up = urllib.request.urlopen(req, timeout=900)
         except urllib.error.HTTPError as e:
-            body = e.read()
-            self.send_response(e.code)
-            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(up.status)
-        ctype = up.headers.get("Content-Type", "application/json")
-        self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
+            up = e                       # an error response is still a response
+        except Exception as e:
+            sys.stderr.write("[free-astra %s] upstream %s %s failed: %s\n"
+                             % (time.strftime("%H:%M:%S"), method, self.path, str(e)[:200]))
+            return self._send(502, {"error": {"message": "upstream: %s" % e}})
+
         try:
+            ctype = up.headers.get("Content-Type", "application/json")
+            streaming = ("event-stream" in ctype
+                         or up.headers.get("Transfer-Encoding", "").lower() == "chunked")
+            if not streaming:
+                body = up.read()
+                self.send_response(up.status)
+                for k, v in up.headers.items():
+                    if k.lower() not in self.HOP:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            self.send_response(up.status)
+            for k, v in up.headers.items():
+                if k.lower() not in self.HOP:
+                    self.send_header(k, v)   # keep content-encoding et al intact
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
             while True:
-                chunk = up.read(8192)
+                # read1, not read: read(n) blocks until n bytes arrive, which stalls
+                # an SSE stream until Codex gives up with "stream disconnected".
+                chunk = up.read1(65536) if hasattr(up, "read1") else up.read(1)
                 if not chunk:
                     break
                 self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
@@ -687,7 +747,10 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            up.close()
+            try:
+                up.close()
+            except Exception:
+                pass
 
     def _responses_out(self, req, model, text, tc, ns_of=None):
         rid = "resp_%s" % os.urandom(12).hex()
@@ -712,17 +775,12 @@ class Handler(BaseHTTPRequestHandler):
         if not req.get("stream"):
             return self._send(200, base)
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        self._sse_start()
 
         seq = [0]
         def ev(kind, payload):
             payload = dict(payload, type=kind, sequence_number=seq[0]); seq[0] += 1
-            self.wfile.write(("event: %s\ndata: %s\n\n" % (kind, json.dumps(payload))).encode())
-            self.wfile.flush()
+            self._sse("event: %s\ndata: %s\n\n" % (kind, json.dumps(payload)))
 
         shell = dict(base, status="in_progress", output=[], usage=None)
         ev("response.created", {"response": shell})
@@ -737,13 +795,21 @@ class Handler(BaseHTTPRequestHandler):
                {"item_id": item["id"], "output_index": 0, "content_index": 0, "text": text})
         ev("response.output_item.done", {"output_index": 0, "item": item})
         ev("response.completed", {"response": base})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._sse_end()
+
+    def do_PUT(self):
+        self._passthrough(self.rfile.read(int(self.headers.get("Content-Length") or 0)), "PUT")
+
+    def do_PATCH(self):
+        self._passthrough(self.rfile.read(int(self.headers.get("Content-Length") or 0)), "PATCH")
+
+    def do_DELETE(self):
+        self._passthrough(method="DELETE")
 
     def do_POST(self):
         is_resp = self.path.split("?")[0].rstrip("/").endswith("/responses")
         if not is_resp and "chat/completions" not in self.path:
-            return self._send(404, {"error": "not found"})
+            return self._passthrough(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
         n = int(self.headers.get("Content-Length") or 0)
         raw_body = self.rfile.read(n)          # keep the bytes for passthrough
         enc = (self.headers.get("Content-Encoding") or "").lower()
@@ -811,17 +877,12 @@ class Handler(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
 
         # Prism has no token stream; emit the finished answer as SSE.
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        self._sse_start()
 
         def chunk(delta, fin=None):
             d = {"id": cid, "object": "chat.completion.chunk", "created": created,
                  "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
-            self.wfile.write(b"data: " + json.dumps(d).encode() + b"\n\n")
-            self.wfile.flush()
+            self._sse("data: " + json.dumps(d) + "\n\n")
 
         chunk({"role": "assistant"})
         if tc:
@@ -830,8 +891,7 @@ class Handler(BaseHTTPRequestHandler):
             for i in range(0, len(text), 600):
                 chunk({"content": text[i:i + 600]})
         chunk({}, finish)
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._sse_end()
 
 
 def demo():
@@ -851,7 +911,9 @@ def demo():
         [{"type": "message", "role": "developer",
           "content": [{"type": "input_text", "text": "<environment_context>cwd=/tmp</environment_context>"}]},
          {"type": "message", "role": "user",
-          "content": [{"type": "input_text", "text": "<recommended_plugins>noise</recommended_plugins>"}]},
+          "content": [{"type": "input_text",
+                       "text": "<recommended_plugins>noise</recommended_plugins>\n"
+                               "<cwd>/srv/app</cwd>"}]},
          {"type": "function_call", "name": "exec_command", "arguments": "{}"},
          {"type": "function_call_output", "output": "a.txt"},
          {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "make it work"}]}],
@@ -859,6 +921,8 @@ def demo():
     assert s3.startswith("<role>next-action emitter</role>")
     assert "- exec_command\n" in s3 and "mcp__x" not in s3
     assert "cwd=/tmp" in s3                      # environment kept
+    # the cwd rides inside the same message we drop as noise - keep it anyway
+    assert "<cwd>/srv/app</cwd>" in s3
     assert "recommended_plugins" not in u3       # scaffolding dropped
     assert u3.startswith("TASK:\nmake it work")  # real task spotlighted
     assert "[executor ran]" in u3 and "a.txt" in u3   # results after the task still kept
@@ -879,6 +943,8 @@ def demo():
     assert env_context([noise]) == "" or "another project" not in env_context([noise])
     assert env_context(["<environment_context>cwd=/srv</environment_context>"]) \
            == "<environment_context>cwd=/srv</environment_context>"
+    assert env_context(["junk <cwd>/a/b</cwd> junk"]) == "<cwd>/a/b</cwd>"
+    assert env_context(["<cwd>/a</cwd>", "<cwd>/a</cwd>"]) == "<cwd>/a</cwd>"
 
     big = ["step %d %s" % (i, "x" * 500) for i in range(100)]
     clamped = clamp_transcript(big, budget=2000)
