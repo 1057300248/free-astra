@@ -109,6 +109,16 @@ _refresh_lock = threading.Lock()
 # requests at once (the turn, a title, a summary), and the extra ones come back
 # 400. Serialise them instead of letting them collide.
 _turn_lock = threading.Semaphore(int(os.environ.get("PRISM_CONCURRENCY", "1")))
+# Prism's allowlist changes without warning - gpt-6-astra was dropped mid-session
+# on 2026-09-17. Fall back rather than failing a running task.
+FALLBACKS = {"gpt-6-astra": ["gpt-5.6-sol", "gpt-5.6-terra"],
+             "gpt-5.6-sol": ["gpt-5.6-terra", "gpt-6-astra"],
+             "gpt-5.6-terra": ["gpt-5.6-sol", "gpt-6-astra"]}
+_substitute = {}          # requested model -> one Prism still accepts
+
+
+def unsupported(reason):
+    return "unsupported assistant model" in (reason or "").lower()
 _last_refresh = [0.0]
 
 
@@ -498,9 +508,13 @@ def _prism_attempt(inp, model, effort, deadline, retries):
                                if o.get("type") == "message"
                                for c in o.get("content", [])), None
             pay = rs.get("payload") or {}
-            last = ("%s: %s" % (pay.get("reason"), pay.get("message", "")))[:300] \
+            body = (((pay.get("codexRequestDebug") or {}).get("error") or {})
+                    .get("bodyText") or "")
+            last = ("%s: %s %s" % (pay.get("reason"), pay.get("message", ""), body))[:400] \
                    or "start returned %s with no turn_state" % s.get("status")
-            if pay.get("reason") in ("sandbox_reconnecting", "unknown") or pay.get("httpStatus") == 504:
+            if unsupported(body):
+                return None, last
+            if pay.get("reason") in ("sandbox_reconnecting",) or pay.get("httpStatus") == 504:
                 mint_sandbox()
             time.sleep(min(2, max(0, deadline - time.time())))
             continue
@@ -523,8 +537,12 @@ def _prism_attempt(inp, model, effort, deadline, retries):
                                    if o.get("type") == "message"
                                    for c in o.get("content", [])), None
                 pay = rs.get("payload") or {}
-                last = ("%s: %s" % (pay.get("reason"), pay.get("message", "")))[:300]
-                if pay.get("reason") in ("sandbox_reconnecting", "unknown") or pay.get("httpStatus") == 504:
+                body = (((pay.get("codexRequestDebug") or {}).get("error") or {})
+                        .get("bodyText") or "")
+                last = ("%s: %s %s" % (pay.get("reason"), pay.get("message", ""), body))[:400]
+                if unsupported(body):
+                    return None, last           # a new sandbox will not help
+                if pay.get("reason") in ("sandbox_reconnecting",) or pay.get("httpStatus") == 504:
                     mint_sandbox()                  # cold or dead sandbox
                 break
             time.sleep(1.5)
@@ -554,13 +572,27 @@ def _call_prism_locked(model, system, user, effort, retries, queued_at):
 
     # the queue wait already spent part of the caller's patience
     budget = max(30.0, BUDGET - (time.time() - queued_at))
+    wanted = model
+    model = _substitute.get(model, model)
     text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
     if text is not None:
         return text
+
+    for alt in FALLBACKS.get(wanted, []) if unsupported(why) else []:
+        if alt == model:
+            continue
+        sys.stderr.write("[free-astra %s] %s rejected by Prism, falling back to %s\n"
+                         % (time.strftime("%H:%M:%S"), model, alt))
+        text, why = _prism_attempt(inp, alt, effort, time.time() + budget, retries)
+        if text is not None:
+            _substitute[wanted] = alt          # stick with it for this process
+            return text
+        if not unsupported(why):
+            break
     # Any terminal failure here usually means stale cookies or a dead sandbox, and
     # both the start and the poll side report it. Re-capture once, then try again.
-    if "turn_state is required" in (why or ""):
-        raise RuntimeError(why)                 # our bug, not a session problem
+    if "turn_state is required" in (why or "") or unsupported(why):
+        raise RuntimeError(why)                 # not a session problem
     if try_refresh(why):
         text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
         if text is not None:

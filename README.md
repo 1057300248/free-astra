@@ -29,6 +29,12 @@ the Codex desktop app. Nothing is replaced.
 | `prism-sol` | GPT-5.6-Sol via Prism |
 | `prism-terra` | GPT-5.6-Terra via Prism |
 
+Prism's allowlist is not ours and it changes without notice: `gpt-6-astra` was
+accepted in the morning of 2026-09-17 and rejected by the afternoon with
+`400: Unsupported assistant model`. When that happens free-astra falls back to a
+model Prism still takes, logs the substitution and keeps your task running, rather
+than failing every request.
+
 It is a real agent, not a chat box: it runs commands and edits files on your
 machine. Verified by handing it a Python file with two bugs, which it fixed and
 re-ran, output confirmed on disk.
