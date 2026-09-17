@@ -76,6 +76,7 @@ if codex exec --model prism-astra --skip-git-repo-check \
   echo
   echo "Your normal models are untouched and still work."
   echo "To undo everything:  $DIR/front-door.sh off && $DIR/front-door.sh unservice"
+  "$DIR/scripts/star.sh" || true
 else
   echo "The smoke test did not pass. Check the log:"
   echo "    tail -30 $STATE/service.log"

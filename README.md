@@ -115,6 +115,20 @@ in your session file. Otherwise it fails fast with:
 and `./install.sh --resession` takes 30 seconds. Set `PRISM_NO_AUTO_REFRESH=1` to
 never let it drive your browser.
 
+## One thing we ask
+
+When the install finishes and the smoke test passes, free-astra asks once whether
+you want to star the repo. That is the only prompt it will ever show you: it writes
+a marker file, so it never asks twice, and it stays silent when there is no terminal
+to ask (CI, pipes, the background service). Nothing is starred without you typing
+`y`. To skip it entirely:
+
+```bash
+FREE_ASTRA_NO_PROMPT=1 ./install.sh
+```
+
+If it saved you some quota, a star genuinely helps other people find it.
+
 ## Fair warning
 
 This drives an OpenAI product through an interface that was not published for it.
