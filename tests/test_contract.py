@@ -45,16 +45,21 @@ class AdapterContractTests(unittest.TestCase):
         fa._prism_attempt = self.originals["_prism_attempt"]
         fa.try_refresh = self.originals["try_refresh"]
 
-    def request(self, method, path, payload=None, headers=None):
-        data = None if payload is None else json.dumps(payload).encode()
+    def raw_request(self, method, path, data=None, headers=None):
         req = urllib.request.Request(
             self.base + path, data=data, method=method,
-            headers={"content-type": "application/json", **(headers or {})})
+            headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status, dict(resp.headers), resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, dict(exc.headers), exc.read()
+
+    def request(self, method, path, payload=None, headers=None):
+        data = None if payload is None else json.dumps(payload).encode()
+        return self.raw_request(
+            method, path, data,
+            {"content-type": "application/json", **(headers or {})})
 
     def test_models_exposes_only_prism_aliases(self):
         status, _, body = self.request("GET", "/v1/models")
@@ -81,7 +86,24 @@ class AdapterContractTests(unittest.TestCase):
         payload = json.loads(body)
         self.assertEqual(seen["model"], "gpt-6-astra")
         self.assertEqual(seen["effort"], "high")
+        self.assertEqual(seen["user"], "[user]\nhello")
         self.assertEqual(payload["model"], "prism-astra")
+
+    def test_responses_string_input_is_not_split_into_characters(self):
+        seen = {}
+
+        def fake(model, system, user, effort, retries=3):
+            seen["user"] = user
+            return "ok"
+
+        fa.call_prism = fake
+        status, _, _ = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": "hello world",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(seen["user"], "[user]\nhello world")
+        self.assertNotIn("[user]\ne\n\n[user]\nl", seen["user"])
 
     def test_previous_response_id_is_explicitly_rejected(self):
         status, _, body = self.request("POST", "/v1/responses", {
@@ -112,6 +134,52 @@ class AdapterContractTests(unittest.TestCase):
         })
         self.assertEqual(status, 400)
         self.assertIn(b"model_not_found", body)
+
+    def test_api_only_unknown_prefixed_routes_fail_closed(self):
+        status, _, body = self.request("GET", "/v1/anything/models")
+        self.assertEqual(status, 404)
+        self.assertIn(b"unsupported_route", body)
+
+        for path in (
+            "/v1/anything/responses",
+            "/v1/anything/chat/completions",
+        ):
+            status, _, body = self.request("POST", path, {"model": "prism-astra"})
+            self.assertEqual(status, 404)
+            self.assertIn(b"unsupported_route", body)
+
+    def test_health_suffix_does_not_bypass_adapter_auth(self):
+        fa.API_KEY = "secret"
+        status, _, body = self.request("GET", "/anything/healthz")
+        self.assertEqual(status, 401)
+        self.assertIn(b"authentication_error", body)
+
+    def test_api_only_rejects_compressed_body_before_decompression(self):
+        # The body does not need to be valid compressed data: API-only must reject
+        # Content-Encoding before invoking any decompressor.
+        status, _, body = self.raw_request(
+            "POST", "/v1/responses",
+            b"not-even-valid-gzip",
+            {"Content-Type": "application/json", "Content-Encoding": "gzip"},
+        )
+        self.assertEqual(status, 415)
+        self.assertIn(b"unsupported_media_type", body)
+
+    def test_invalid_json_field_types_return_400(self):
+        cases = [
+            {"model": 123, "input": "hello"},
+            {"model": "prism-astra", "input": 123},
+            {"model": "prism-astra", "input": "hello", "tools": [123]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "name": 123, "parameters": {}}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "function": "not-an-object"}]},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                status, _, body = self.request("POST", "/v1/responses", payload)
+                self.assertEqual(status, 400, body)
+                self.assertIn(b"invalid_request_error", body)
 
     def test_stream_emits_responses_lifecycle(self):
         fa.call_prism = lambda model, system, user, effort, retries=3: "hello"
@@ -160,6 +228,17 @@ class AdapterContractTests(unittest.TestCase):
         text = body.decode()
         self.assertIn("event: response.function_call_arguments.delta", text)
         self.assertIn("event: response.function_call_arguments.done", text)
+        done_blocks = [
+            block for block in text.split("\n\n")
+            if block.startswith("event: response.function_call_arguments.done\n")
+        ]
+        self.assertEqual(len(done_blocks), 1)
+        data_line = next(
+            line for line in done_blocks[0].splitlines()
+            if line.startswith("data: "))
+        done_payload = json.loads(data_line[len("data: "):])
+        self.assertEqual(done_payload["name"], "echo")
+        self.assertEqual(json.loads(done_payload["arguments"]), {"value": "ok"})
 
     def test_unknown_model_emitted_tool_is_rejected(self):
         with self.assertRaises(fa.ToolProtocolError):
