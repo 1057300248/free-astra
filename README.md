@@ -131,7 +131,10 @@ Point the gateway at `http://127.0.0.1:8319/v1` (or a private network address if
 the adapter runs on another host). API mode only exposes the `prism-*` model
 aliases through `/v1/models`; unknown models and routes are rejected instead of
 being passed through to the Codex backend, so caller Authorization headers cannot
-leak across that boundary.
+leak across that boundary. API-only requests must use normal Content-Length framing
+(no `Transfer-Encoding: chunked`), and must provide an explicit non-null `model`.
+Responses requests must include `input`; Chat Completions requests must include
+`messages`.
 
 For long-running HTTP requests, streaming connections are opened before Prism
 finishes and receive SSE heartbeat comments while Prism is polling. Responses API
