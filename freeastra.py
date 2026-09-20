@@ -209,6 +209,10 @@ def try_refresh(reason, cancel=None):
         load_session()
         sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "session refreshed\n")
         return True
+    except SystemExit as e:
+        sys.stderr.write("[free-astra %s] refresh produced an unusable session: %s\n"
+                         % (time.strftime("%H:%M:%S"), e))
+        return False
     finally:
         if proc is not None and proc.poll() is None:
             proc.kill()
@@ -226,6 +230,20 @@ def load_session():
         raise SystemExit("%s needs at least 'cookie' and 'sandbox_token' - run "
                          "./install.sh (or scripts/refresh-session.sh)" % SESSION_FILE)
     return _session
+
+
+def check_api_config():
+    if not API_ONLY or API_KEY:
+        return
+    if os.environ.get("PRISM_ALLOW_INSECURE", "").lower() in ("1", "true", "yes", "on"):
+        return
+    bind = BIND.strip().strip("[]").lower()
+    if bind in ("127.0.0.1", "localhost", "::1"):
+        return
+    raise SystemExit(
+        "PRISM_API_ONLY=1 with an empty PRISM_API_KEY on PRISM_BIND=%r would be an "
+        "open proxy; set PRISM_API_KEY, bind a loopback address, or set "
+        "PRISM_ALLOW_INSECURE=1 if the network path is already trusted" % BIND)
 
 
 def post(path, body, timeout=180):
@@ -297,7 +315,9 @@ def additional_tool_specs(items):
         if not isinstance(it, dict) or it.get("type") != "additional_tools":
             continue
 
-        def walk(ts, ns=None):
+        def walk(ts, ns=None, depth=0):
+            if depth > 8:
+                raise ClientInputError("additional_tools nests too deeply")
             if ts is None:
                 return
             if not isinstance(ts, list):
@@ -309,7 +329,7 @@ def additional_tool_specs(items):
                     name = t.get("name")
                     if name is not None and not isinstance(name, str):
                         raise ClientInputError("tool namespace name must be a string")
-                    walk(t.get("tools"), name)
+                    walk(t.get("tools"), name, depth + 1)
                     continue
                 if t.get("type") != "function":
                     continue
@@ -463,6 +483,12 @@ def _as_text(value, where):
     raise ClientInputError("%s must be a string" % where)
 
 
+def _output_text(value, where):
+    if isinstance(value, list):
+        return _content_text(value, where)
+    return _as_text(value, where)
+
+
 def _content_text(content, where="content"):
     if content is None:
         return ""
@@ -537,16 +563,20 @@ def flatten_responses(items, instructions, tools):
             raise ClientInputError("Responses input items must be strings or objects")
         t = it.get("type", "message")
         if t == "function_call":
-            convo.append("[executor ran]\n%s %s" % (it.get("name"), it.get("arguments")))
+            name = it.get("name")
+            if name is not None and not isinstance(name, str):
+                raise ClientInputError("function_call.name must be a string")
+            convo.append("[executor ran]\n%s %s" % (
+                name or "", _as_text(it.get("arguments"), "function_call.arguments")))
         elif t == "function_call_output":
             convo.append("[result]\n"
-                         + _as_text(it.get("output"), "function_call_output.output")[:8000])
+                         + _output_text(it.get("output"), "function_call_output.output")[:8000])
         elif t == "custom_tool_call":
             convo.append("[executor ran]\n%s"
                          % _as_text(it.get("input"), "custom_tool_call.input")[:4000])
         elif t == "custom_tool_call_output":
             convo.append("[result]\n"
-                         + _as_text(it.get("output"), "custom_tool_call_output.output")[:8000])
+                         + _output_text(it.get("output"), "custom_tool_call_output.output")[:8000])
         elif t == "additional_tools":
             continue
         elif t == "message":
@@ -626,10 +656,15 @@ def parse_tool_call(text, allowed_names=None):
                          "arguments": json.dumps(args, ensure_ascii=False)}}
 
 
+def keepalive_period():
+    default = "0" if API_ONLY else "600"
+    return float(os.environ.get("PRISM_KEEPALIVE", default))
+
+
 def keepalive_loop():
     """The sandbox goes cold when idle and then every call fails for a minute or
     two while we notice and re-capture. Cheaper to poke it on a timer."""
-    period = float(os.environ.get("PRISM_KEEPALIVE", "600"))
+    period = keepalive_period()
     if period <= 0:
         return
     while True:
@@ -699,7 +734,7 @@ def _prism_attempt(inp, model, effort, deadline, retries, cancel=None):
                 return None, last
             if pay.get("reason") in ("sandbox_reconnecting",) or pay.get("httpStatus") == 504:
                 mint_sandbox()
-            time.sleep(min(2, max(0, deadline - time.time())))
+            _pause(min(2, max(0, deadline - time.time())), cancel)
             continue
 
         p = {"request_id": s["request_id"], "turn_state": s["turn_state"]}
@@ -816,7 +851,8 @@ class Handler(BaseHTTPRequestHandler):
         if hmac.compare_digest(supplied, ("Bearer " + API_KEY).encode()):
             return True
         self._send(401, {"error": {"message": "invalid adapter API key",
-                                    "type": "authentication_error"}}, close=True)
+                                    "type": "authentication_error"}}, close=True,
+                   body=self.command != "HEAD")
         return False
 
     def _reject_unsolicited_body(self):
@@ -920,18 +956,39 @@ class Handler(BaseHTTPRequestHandler):
             raise box["error"]
         return box.get("value")
 
-    def _send(self, code, obj, ctype="application/json", close=False):
-        body = (obj if isinstance(obj, bytes) else json.dumps(obj).encode())
+    def _send(self, code, obj, ctype="application/json", close=False, body=True):
+        payload = (obj if isinstance(obj, bytes) else json.dumps(obj).encode())
         if close:
             self.close_connection = True
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        if close:
-            self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            if close:
+                self.send_header("Connection", "close")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if body:
+                self.wfile.write(payload)
+        except OSError:
+            self.close_connection = True
+
+    def _passthrough_body(self):
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return b""
+        value = values[0]
+        if len(values) != 1 or not (value.isascii() and value.isdigit()):
+            self._send(400, {"error": {
+                "message": "Content-Length must be a non-negative integer",
+                "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
+            return None
+        digits = value.lstrip("0") or "0"
+        if len(digits) > 10:
+            self._send(413, {"error": {"message": "request body too large",
+                                        "type": "invalid_request_error"}}, close=True)
+            return None
+        return self.rfile.read(int(digits))
 
     def do_OPTIONS(self):
         if self._reject_unsolicited_body():
@@ -985,6 +1042,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(426, {"error": "websocket transport not supported"})
         self._passthrough(method="GET")
 
+    def do_HEAD(self):
+        if not self._authorized():
+            return
+        if self._reject_unsolicited_body():
+            return
+        clean = self._clean_path()
+        if clean in ("/healthz", "/v1/healthz"):
+            return self._send(200, {"status": "ok"}, body=False)
+        if clean in ("/readyz", "/v1/readyz"):
+            ready = bool(_session.get("cookie") and _session.get("sandbox_token"))
+            return self._send(200 if ready else 503,
+                              {"status": "ready" if ready else "not_ready"}, body=False)
+        if clean == "/v1/models":
+            return self._send(200, {"object": "list", "data": [
+                {"id": m, "object": "model", "created": 0, "owned_by": "prism"}
+                for m in ALIAS]}, body=False)
+        if clean == "/v1/responses":
+            return self._send(426, {"error": "websocket transport not supported"},
+                              body=False)
+        if API_ONLY:
+            return self._send(404, {"error": {"message": "route is not served by the Prism adapter",
+                                               "type": "unsupported_route"}}, body=False)
+        return self._send(405, {"error": {"message": "method not allowed",
+                                           "type": "unsupported_route"}}, body=False)
 
     # headers that describe OUR hop, not the payload, so they must not be copied
     HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
@@ -1133,7 +1214,10 @@ class Handler(BaseHTTPRequestHandler):
         if API_ONLY:
             return self._send(405, {"error": {"message": "method not allowed",
                                                "type": "unsupported_route"}}, close=True)
-        self._passthrough(self.rfile.read(int(self.headers.get("Content-Length") or 0)), "PUT")
+        raw_body = self._passthrough_body()
+        if raw_body is None:
+            return
+        self._passthrough(raw_body, "PUT")
 
     def do_PATCH(self):
         if not self._authorized():
@@ -1141,7 +1225,10 @@ class Handler(BaseHTTPRequestHandler):
         if API_ONLY:
             return self._send(405, {"error": {"message": "method not allowed",
                                                "type": "unsupported_route"}}, close=True)
-        self._passthrough(self.rfile.read(int(self.headers.get("Content-Length") or 0)), "PATCH")
+        raw_body = self._passthrough_body()
+        if raw_body is None:
+            return
+        self._passthrough(raw_body, "PATCH")
 
     def do_DELETE(self):
         if not self._authorized():
@@ -1161,8 +1248,10 @@ class Handler(BaseHTTPRequestHandler):
             if API_ONLY:
                 return self._send(404, {"error": {"message": "route is not served by the Prism adapter",
                                                    "type": "unsupported_route"}}, close=True)
-            return self._passthrough(
-                self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            raw_body = self._passthrough_body()
+            if raw_body is None:
+                return
+            return self._passthrough(raw_body)
 
         transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
         content_lengths = self.headers.get_all("Content-Length") or []
@@ -1415,8 +1504,12 @@ class Handler(BaseHTTPRequestHandler):
             repr(text[:160])))
 
         if is_resp:
-            return self._responses_out(req, requested, text, tc, ns_of,
-                                       stream_started=stream)
+            try:
+                return self._responses_out(req, requested, text, tc, ns_of,
+                                           stream_started=stream)
+            except OSError:
+                self.close_connection = True
+                return
 
         msg = {"role": "assistant", "content": None if tc else text}
         if tc:
@@ -1438,14 +1531,17 @@ class Handler(BaseHTTPRequestHandler):
                  "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
             self._sse("data: " + json.dumps(d) + "\n\n")
 
-        chunk({"role": "assistant"})
-        if tc:
-            chunk({"tool_calls": [dict(index=0, **tc)]})
-        elif text:
-            for i in range(0, len(text), 600):
-                chunk({"content": text[i:i + 600]})
-        chunk({}, finish)
-        self._sse_end(include_done=True)
+        try:
+            chunk({"role": "assistant"})
+            if tc:
+                chunk({"tool_calls": [dict(index=0, **tc)]})
+            elif text:
+                for i in range(0, len(text), 600):
+                    chunk({"content": text[i:i + 600]})
+            chunk({}, finish)
+            self._sse_end(include_done=True)
+        except OSError:
+            self.close_connection = True
 
 
 def demo():
@@ -1533,6 +1629,7 @@ if __name__ == "__main__":
     if "--demo" in sys.argv:
         demo(); raise SystemExit
     load_session()
+    check_api_config()
     UPSTREAM = pick_upstream()
     print("upstream: %s" % UPSTREAM)
     print("free-astra on http://%s:%d/v1  models=%s  effort=%s  api_only=%s"

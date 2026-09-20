@@ -612,7 +612,16 @@ class AdapterContractTests(unittest.TestCase):
 
     def test_api_only_disables_browser_auto_refresh(self):
         self.assertTrue(fa.API_ONLY)
-        self.assertFalse(fa.try_refresh("stale session"))
+        before = fa._last_refresh[0]
+        original = fa.os.path.exists
+        fa.os.path.exists = lambda path: True
+        try:
+            self.assertFalse(fa.try_refresh("stale session"))
+            touched = fa._last_refresh[0] != before
+        finally:
+            fa.os.path.exists = original
+            fa._last_refresh[0] = before
+        self.assertFalse(touched)
 
     def test_cancelled_refresh_never_spawns(self):
         fa.API_ONLY = False
@@ -621,6 +630,151 @@ class AdapterContractTests(unittest.TestCase):
         cancel.set()
         with self.assertRaises(fa.CancelledError):
             fa.try_refresh("stale session", cancel=cancel)
+
+    def test_api_only_disables_keepalive_by_default(self):
+        saved = fa.os.environ.pop("PRISM_KEEPALIVE", None)
+        try:
+            fa.API_ONLY = True
+            self.assertEqual(fa.keepalive_period(), 0.0)
+            fa.API_ONLY = False
+            self.assertEqual(fa.keepalive_period(), 600.0)
+            fa.os.environ["PRISM_KEEPALIVE"] = "30"
+            self.assertEqual(fa.keepalive_period(), 30.0)
+        finally:
+            if saved is None:
+                fa.os.environ.pop("PRISM_KEEPALIVE", None)
+            else:
+                fa.os.environ["PRISM_KEEPALIVE"] = saved
+
+    def test_api_only_insecure_bind_is_refused(self):
+        saved_bind = fa.BIND
+        saved_allow = fa.os.environ.pop("PRISM_ALLOW_INSECURE", None)
+        try:
+            fa.API_ONLY = True
+            fa.API_KEY = ""
+            fa.BIND = "0.0.0.0"
+            with self.assertRaises(SystemExit):
+                fa.check_api_config()
+            fa.BIND = "127.0.0.1"
+            fa.check_api_config()
+            fa.BIND = "0.0.0.0"
+            fa.API_KEY = "secret"
+            fa.check_api_config()
+            fa.API_KEY = ""
+            fa.os.environ["PRISM_ALLOW_INSECURE"] = "1"
+            fa.check_api_config()
+        finally:
+            fa.BIND = saved_bind
+            fa.API_KEY = ""
+            if saved_allow is None:
+                fa.os.environ.pop("PRISM_ALLOW_INSECURE", None)
+            else:
+                fa.os.environ["PRISM_ALLOW_INSECURE"] = saved_allow
+
+    def test_head_mirrors_get_without_body(self):
+        status, headers, body = self.raw_request("HEAD", "/v1/models")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertGreater(int(headers.get("Content-Length", "0")), 0)
+
+        status, _, body = self.raw_request("HEAD", "/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+
+        status, _, body = self.raw_request("HEAD", "/v1/anything")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, b"")
+
+        fa.API_KEY = "secret"
+        status, _, body = self.raw_request("HEAD", "/v1/models")
+        self.assertEqual(status, 401)
+        self.assertEqual(body, b"")
+
+    def test_function_call_fields_are_type_checked(self):
+        cases = [
+            {"type": "function_call", "name": 123, "arguments": "{}"},
+            {"type": "function_call", "name": "x", "arguments": 0},
+        ]
+        for item in cases:
+            with self.subTest(item=item):
+                status, _, body = self.request("POST", "/v1/responses", {
+                    "model": "prism-astra", "input": [item],
+                })
+                self.assertEqual(status, 400, body)
+                self.assertIn(b"invalid_request_error", body)
+
+    def test_function_call_dict_arguments_are_serialized(self):
+        seen = {}
+
+        def fake(model, system, user, effort, retries=3, cancel=None):
+            seen["user"] = user
+            return "ok"
+
+        fa.call_prism = fake
+        status, _, _ = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": [{"type": "function_call", "name": "x", "arguments": {"a": 1}}, "go"],
+        })
+        self.assertEqual(status, 200)
+        self.assertIn('{"a": 1}', seen["user"])
+
+    def test_function_call_output_content_parts_are_joined(self):
+        seen = {}
+
+        def fake(model, system, user, effort, retries=3, cancel=None):
+            seen["user"] = user
+            return "ok"
+
+        fa.call_prism = fake
+        status, _, _ = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": [
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "input_text", "text": " world"},
+                ]},
+                "go",
+            ],
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("hello world", seen["user"])
+
+    def test_function_call_output_image_part_is_rejected(self):
+        status, _, body = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": [{
+                "type": "function_call_output", "call_id": "c1",
+                "output": [{"type": "input_image",
+                            "image_url": "https://example.invalid/a.png"}],
+            }],
+        })
+        self.assertEqual(status, 400, body)
+        self.assertIn(b"text-only", body)
+
+    def test_deeply_nested_additional_tools_are_rejected(self):
+        node = {"type": "function", "name": "leaf", "parameters": {}}
+        for _ in range(12):
+            node = {"type": "namespace", "name": "ns", "tools": [node]}
+        status, _, body = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": [{"type": "additional_tools", "tools": [node]}, "go"],
+        })
+        self.assertEqual(status, 400, body)
+        self.assertIn(b"nests too deeply", body)
+
+    def test_passthrough_malformed_content_length_is_400(self):
+        fa.API_ONLY = False
+        status, _, body = self.raw_http(
+            b"POST /v1/embeddings HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: abc\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertIn(b"non-negative", body)
+
+        status, _, body = self.raw_http(
+            b"POST /v1/embeddings HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}")
+        self.assertEqual(status, 400)
+        self.assertIn(b"Content-Length", body)
 
     def test_optional_adapter_api_key(self):
         fa.API_KEY = "secret"

@@ -134,7 +134,8 @@ being passed through to the Codex backend, so caller Authorization headers canno
 leak across that boundary. API-only requests must use normal Content-Length framing
 (no `Transfer-Encoding: chunked`), and must provide an explicit non-null `model`.
 Responses requests must include `input`; Chat Completions requests must include
-`messages`.
+`messages`. Without `PRISM_API_KEY`, API mode only accepts a loopback `PRISM_BIND`;
+it refuses to start on a non-loopback address unless `PRISM_ALLOW_INSECURE=1`.
 
 For long-running HTTP requests, streaming connections are opened before Prism
 finishes and receive SSE heartbeat comments while Prism is polling. Responses API
@@ -154,10 +155,17 @@ Useful service settings:
   bombs; keep compression disabled at this adapter boundary.
 - `PRISM_MAX_TOOL_SCHEMA` — maximum JSON size of one emulated tool schema.
 - `PRISM_API_KEY` — optional bearer token required by adapter API routes.
+- `PRISM_ALLOW_INSECURE` — allow API-only serving without a key on a non-loopback
+  bind; do not set this on an untrusted network.
 - `PRISM_API_REFRESH` — API-only mode disables the bundled browser session refresh
   by default; run an external session/account refresher, or set this to `1` to let
   the adapter run `refresh-session.sh` itself.
+- `PRISM_KEEPALIVE` — seconds between keep-alive pings; defaults to `0` in API-only
+  mode (and `600` otherwise). Set a positive value to keep a sandbox warm.
 - `PRISM_BIND` — bind address; defaults to loopback.
+
+`/healthz` is a liveness check; `/readyz` reports the captured session fields only
+and does not probe Prism, so it cannot detect a stale cookie or a cold sandbox.
 
 The adapter still cannot provide authoritative token usage: Prism does not expose
 it, so `usage` remains zero. Do not use upstream usage for billing. A single Prism
