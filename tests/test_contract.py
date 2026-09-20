@@ -89,7 +89,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_responses_reads_nested_reasoning_effort(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3):
+        def fake(model, system, user, effort, retries=3, cancel=None):
             seen.update(model=model, effort=effort, user=user)
             return "ok"
 
@@ -109,7 +109,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_responses_string_input_is_not_split_into_characters(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3):
+        def fake(model, system, user, effort, retries=3, cancel=None):
             seen["user"] = user
             return "ok"
 
@@ -206,6 +206,25 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn(b"non-negative", body)
 
+        status, _, body = self.raw_http(
+            base + b"Content-Length: " + b"9" * 5000 + b"\r\n\r\n")
+        self.assertEqual(status, 413)
+        self.assertIn(b"too large", body)
+
+    def test_requests_with_body_are_rejected_on_get_and_options(self):
+        status, head, body = self.raw_http(
+            b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Content-Length: 2\r\n\r\n{}")
+        self.assertEqual(status, 400)
+        self.assertIn(b"Connection: close", head)
+        self.assertIn(b"must not carry a body", body)
+
+        status, head, _ = self.raw_http(
+            b"OPTIONS /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertIn(b"Connection: close", head)
+
     def test_api_only_early_rejections_close_connections(self):
         base = (
             b"POST /v1/responses HTTP/1.1\r\n"
@@ -234,7 +253,8 @@ class AdapterContractTests(unittest.TestCase):
         self.assertIn(b"Connection: close", head)
 
     def test_successful_requests_keep_connection_alive(self):
-        request = b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        request = (b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   b"Content-Length: 0\r\n\r\n")
         with socket.create_connection(
                 ("127.0.0.1", self.server.server_port), timeout=3) as sock:
             sock.sendall(request * 2)
@@ -244,6 +264,9 @@ class AdapterContractTests(unittest.TestCase):
                 if not chunk:
                     break
                 data += chunk
+            sock.shutdown(socket.SHUT_WR)
+            while sock.recv(65536):
+                pass
         self.assertEqual(data.count(b"HTTP/1.1 200"), 2)
 
     def test_api_only_rejects_compressed_body_before_decompression(self):
@@ -350,7 +373,7 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertIn(b"invalid_request_error", body)
 
     def test_stream_emits_responses_lifecycle(self):
-        fa.call_prism = lambda model, system, user, effort, retries=3: "hello"
+        fa.call_prism = lambda model, system, user, effort, retries=3, cancel=None: "hello"
         status, headers, body = self.request("POST", "/v1/responses", {
             "model": "prism-sol",
             "input": "hello",
@@ -374,7 +397,7 @@ class AdapterContractTests(unittest.TestCase):
         self.assertNotIn("[DONE]", text)
 
     def test_stream_emits_function_argument_events(self):
-        fa.call_prism = lambda model, system, user, effort, retries=3: (
+        fa.call_prism = lambda model, system, user, effort, retries=3, cancel=None: (
             '{"tool_call":{"name":"echo","arguments":{"value":"ok"}}}'
         )
         status, _, body = self.request("POST", "/v1/responses", {
@@ -437,7 +460,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_strict_model_identity_disables_fallback_by_default(self):
         calls = []
 
-        def fake_attempt(inp, model, effort, deadline, retries):
+        def fake_attempt(inp, model, effort, deadline, retries, cancel=None):
             calls.append(model)
             return None, "400 Unsupported assistant model"
 
@@ -458,6 +481,82 @@ class AdapterContractTests(unittest.TestCase):
         _, user = fa.flatten_responses(
             [{"type": "reasoning", "summary": []}, "hello"], None, [])
         self.assertEqual(user, "[user]\nhello")
+
+    def test_malformed_tool_item_fields_return_400(self):
+        cases = [
+            {"type": "function_call_output", "output": 123},
+            {"type": "custom_tool_call", "input": 123},
+            {"type": "custom_tool_call_output", "output": 123},
+        ]
+        for item in cases:
+            with self.subTest(item=item):
+                status, _, body = self.request("POST", "/v1/responses", {
+                    "model": "prism-astra",
+                    "input": [item],
+                })
+                self.assertEqual(status, 400, body)
+                self.assertIn(b"invalid_request_error", body)
+
+    def test_structured_tool_output_is_serialized(self):
+        seen = {}
+
+        def fake(model, system, user, effort, retries=3, cancel=None):
+            seen["user"] = user
+            return "ok"
+
+        fa.call_prism = fake
+        status, _, _ = self.request("POST", "/v1/responses", {
+            "model": "prism-astra",
+            "input": [
+                {"type": "function_call_output", "call_id": "c1", "output": {"a": 1}},
+                "hello",
+            ],
+        })
+        self.assertEqual(status, 200)
+        self.assertIn('{"a": 1}', seen["user"])
+
+    def test_pre_cancelled_prism_attempt_stops_immediately(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(fa.CancelledError):
+            fa._prism_attempt([], "gpt-6-astra", "low", fa.time.time() + 60, 3,
+                              cancel=cancel)
+
+    def test_pre_cancelled_call_prism_does_not_take_the_sandbox(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(fa.CancelledError):
+            fa.call_prism("gpt-6-astra", "", "hi", "low", retries=1, cancel=cancel)
+
+    def test_stream_disconnect_cancels_prism_worker(self):
+        started = threading.Event()
+        release = threading.Event()
+        seen = {}
+
+        def slow(model, system, user, effort, retries=3, cancel=None):
+            seen["cancel"] = cancel
+            started.set()
+            release.wait(5)
+            return "late"
+
+        fa.call_prism = slow
+        body = json.dumps({
+            "model": "prism-astra", "input": "hello", "stream": True,
+        }).encode()
+        with socket.create_connection(
+                ("127.0.0.1", self.server.server_port), timeout=3) as sock:
+            sock.sendall(
+                b"POST /v1/responses HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body) + body)
+            sock.recv(1024)
+        self.assertTrue(started.wait(3))
+        deadline = fa.time.time() + 5
+        while not seen["cancel"].is_set() and fa.time.time() < deadline:
+            fa.time.sleep(0.05)
+        self.assertTrue(seen["cancel"].is_set())
+        release.set()
 
     def test_optional_adapter_api_key(self):
         fa.API_KEY = "secret"

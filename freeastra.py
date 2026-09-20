@@ -140,6 +140,14 @@ class BusyError(RuntimeError):
     pass
 
 
+class CancelledError(RuntimeError):
+    pass
+
+
+class ClientDisconnected(ConnectionError):
+    pass
+
+
 class ToolProtocolError(RuntimeError):
     pass
 
@@ -418,6 +426,16 @@ def assemble(sys_parts, convo, tools, env_parts=None):
     return system, user
 
 
+def _as_text(value, where):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    raise ClientInputError("%s must be a string" % where)
+
+
 def _content_text(content, where="content"):
     if content is None:
         return ""
@@ -494,17 +512,14 @@ def flatten_responses(items, instructions, tools):
         if t == "function_call":
             convo.append("[executor ran]\n%s %s" % (it.get("name"), it.get("arguments")))
         elif t == "function_call_output":
-            out = it.get("output")
-            if isinstance(out, (dict, list)):
-                out = json.dumps(out, ensure_ascii=False)
-            convo.append("[result]\n" + (out or "")[:8000])
+            convo.append("[result]\n"
+                         + _as_text(it.get("output"), "function_call_output.output")[:8000])
         elif t == "custom_tool_call":
-            convo.append("[executor ran]\n%s" % (it.get("input") or "")[:4000])
+            convo.append("[executor ran]\n%s"
+                         % _as_text(it.get("input"), "custom_tool_call.input")[:4000])
         elif t == "custom_tool_call_output":
-            out = it.get("output")
-            if isinstance(out, (dict, list)):
-                out = json.dumps(out, ensure_ascii=False)
-            convo.append("[result]\n" + (out or "")[:8000])
+            convo.append("[result]\n"
+                         + _as_text(it.get("output"), "custom_tool_call_output.output")[:8000])
         elif t == "additional_tools":
             continue
         elif t == "message":
@@ -600,10 +615,23 @@ def keepalive_loop():
                              % (time.strftime("%H:%M:%S"), str(e)[:160]))
 
 
-def _prism_attempt(inp, model, effort, deadline, retries):
+def _check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("client disconnected; Prism turn abandoned")
+
+
+def _pause(seconds, cancel):
+    if cancel is not None:
+        cancel.wait(seconds)
+    else:
+        time.sleep(seconds)
+
+
+def _prism_attempt(inp, model, effort, deadline, retries, cancel=None):
     """One pass at getting an answer. Returns (text, None) or (None, reason)."""
     last = ""
     for attempt in range(retries):
+        _check_cancel(cancel)
         if deadline - time.time() <= 5:
             return None, last or "out of time"
         meta = {"model": model, "reasoning_effort": effort, "frontend_origin": BASE,
@@ -615,13 +643,14 @@ def _prism_attempt(inp, model, effort, deadline, retries):
 
         st, s = post("/api/llm/response_with_tools_start", {"input": inp, "metadata": meta},
                      timeout=max(60, min(deadline - time.time(), 180)))
+        _check_cancel(cancel)
         if st != 200 or "request_id" not in s:
             last = "start http=%s %s" % (st, json.dumps(s)[:300])
             sys.stderr.write("[free-astra %s] start failed http=%s body=%s\n"
                              % (time.strftime("%H:%M:%S"), st, json.dumps(s)[:400]))
             if st in (400, 401, 403):
                 return None, last                  # auth-shaped: retrying cannot help
-            time.sleep(min(3, max(0, deadline - time.time())))
+            _pause(min(3, max(0, deadline - time.time())), cancel)
             continue
 
         # `start` can finish the turn outright, and then it carries no turn_state.
@@ -648,6 +677,7 @@ def _prism_attempt(inp, model, effort, deadline, retries):
 
         p = {"request_id": s["request_id"], "turn_state": s["turn_state"]}
         while time.time() < deadline:
+            _check_cancel(cancel)
             st, j = post("/api/llm/response_with_tools_status", p,
                          timeout=min(max(deadline - time.time(), 5), 60))
             if st != 200:
@@ -672,24 +702,26 @@ def _prism_attempt(inp, model, effort, deadline, retries):
                 if pay.get("reason") in ("sandbox_reconnecting",) or pay.get("httpStatus") == 504:
                     mint_sandbox()                  # cold or dead sandbox
                 break
-            time.sleep(1.5)
+            _pause(1.5, cancel)
         else:
             return None, "timed out after %.0fs" % BUDGET
-        time.sleep(min(2, max(0, deadline - time.time())))
+        _pause(min(2, max(0, deadline - time.time())), cancel)
     return None, last or "no response"
 
 
-def call_prism(model, system, user, effort, retries=3):
+def call_prism(model, system, user, effort, retries=3, cancel=None):
+    _check_cancel(cancel)
     waited = time.time()
     if not _turn_lock.acquire(timeout=QUEUE_TIMEOUT):
         raise BusyError("Prism sandbox is busy; retry later")
     try:
-        return _call_prism_locked(model, system, user, effort, retries, waited)
+        _check_cancel(cancel)
+        return _call_prism_locked(model, system, user, effort, retries, waited, cancel)
     finally:
         _turn_lock.release()
 
 
-def _call_prism_locked(model, system, user, effort, retries, queued_at):
+def _call_prism_locked(model, system, user, effort, retries, queued_at, cancel=None):
     inp = []
     if system:
         inp.append({"type": "message", "role": "system",
@@ -701,16 +733,18 @@ def _call_prism_locked(model, system, user, effort, retries, queued_at):
     budget = max(30.0, BUDGET - (time.time() - queued_at))
     wanted = model
     model = _substitute.get(model, model)
-    text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
+    _check_cancel(cancel)
+    text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries, cancel)
     if text is not None:
         return text
 
     for alt in FALLBACKS.get(wanted, []) if (ALLOW_FALLBACK and unsupported(why)) else []:
         if alt == model:
             continue
+        _check_cancel(cancel)
         sys.stderr.write("[free-astra %s] %s rejected by Prism, falling back to %s\n"
                          % (time.strftime("%H:%M:%S"), model, alt))
-        text, why = _prism_attempt(inp, alt, effort, time.time() + budget, retries)
+        text, why = _prism_attempt(inp, alt, effort, time.time() + budget, retries, cancel)
         if text is not None:
             _substitute[wanted] = alt          # stick with it for this process
             return text
@@ -720,8 +754,9 @@ def _call_prism_locked(model, system, user, effort, retries, queued_at):
     # both the start and the poll side report it. Re-capture once, then try again.
     if "turn_state is required" in (why or "") or unsupported(why):
         raise RuntimeError(why)                 # not a session problem
+    _check_cancel(cancel)
     if try_refresh(why):
-        text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries)
+        text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries, cancel)
         if text is not None:
             return text
     raise RuntimeError(
@@ -751,6 +786,33 @@ class Handler(BaseHTTPRequestHandler):
                                     "type": "authentication_error"}}, close=True)
         return False
 
+    def _reject_unsolicited_body(self):
+        transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
+        content_lengths = self.headers.get_all("Content-Length") or []
+        if transfer_encodings:
+            self._send(400, {"error": {
+                "message": "Transfer-Encoding is not supported for this method",
+                "type": "invalid_request_error", "param": "Transfer-Encoding"}}, close=True)
+            return True
+        if len(content_lengths) > 1:
+            self._send(400, {"error": {
+                "message": "exactly one Content-Length header is required",
+                "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
+            return True
+        if content_lengths:
+            value = content_lengths[0]
+            if not (value.isascii() and value.isdigit()):
+                self._send(400, {"error": {
+                    "message": "Content-Length must be a non-negative integer",
+                    "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
+                return True
+            if (value.lstrip("0") or "0") != "0":
+                self._send(400, {"error": {
+                    "message": "%s requests must not carry a body" % self.command,
+                    "type": "invalid_request_error"}}, close=True)
+                return True
+        return False
+
     def _sse_start(self):
         """HTTP/1.1 needs explicit framing. Without Content-Length or
         Transfer-Encoding the client cannot tell where the body ends and reports
@@ -773,16 +835,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _stream_error(self, message, kind, responses_api):
-        if responses_api:
-            payload = {"type": "error", "error": {"type": kind, "message": str(message)}}
-            self._sse("event: error\ndata: %s\n\n" % json.dumps(payload))
-            self._sse_end(include_done=False)
-        else:
-            self._sse("data: %s\n\n" % json.dumps(
-                {"error": {"type": kind, "message": str(message)}}))
-            self._sse_end(include_done=True)
+        try:
+            if responses_api:
+                payload = {"type": "error", "error": {"type": kind, "message": str(message)}}
+                self._sse("event: error\ndata: %s\n\n" % json.dumps(payload))
+                self._sse_end(include_done=False)
+            else:
+                self._sse("data: %s\n\n" % json.dumps(
+                    {"error": {"type": kind, "message": str(message)}}))
+                self._sse_end(include_done=True)
+        except OSError:
+            self.close_connection = True
 
-    def _call_with_heartbeat(self, fn):
+    def _call_with_heartbeat(self, fn, cancel):
         if SSE_HEARTBEAT <= 0:
             return fn()
         done = threading.Event()
@@ -798,7 +863,11 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Thread(target=worker, daemon=True).start()
         while not done.wait(SSE_HEARTBEAT):
-            self._sse(b": ping\n\n")
+            try:
+                self._sse(b": ping\n\n")
+            except OSError:
+                cancel.set()
+                raise ClientDisconnected("client disconnected during streaming")
         if "error" in box:
             raise box["error"]
         return box.get("value")
@@ -817,6 +886,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if self._reject_unsolicited_body():
+            return
         clean = self._clean_path()
         allowed = {
             "/v1/models", "/v1/responses", "/v1/chat/completions",
@@ -834,6 +905,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self._authorized():
+            return
+        if self._reject_unsolicited_body():
             return
         clean = self._clean_path()
         if clean in ("/healthz", "/v1/healthz"):
@@ -1062,10 +1135,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": {
                 "message": "Content-Length must be a non-negative integer",
                 "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
-        n = int(content_length) if content_length is not None else 0
-        if n > MAX_BODY:
-            return self._send(413, {"error": {"message": "request body too large",
-                                               "type": "invalid_request_error"}}, close=True)
+        if content_length is None:
+            n = 0
+        else:
+            digits = content_length.lstrip("0") or "0"
+            limit = str(MAX_BODY)
+            if len(digits) > len(limit) or (len(digits) == len(limit) and digits > limit):
+                return self._send(413, {"error": {"message": "request body too large",
+                                                   "type": "invalid_request_error"}}, close=True)
+            n = int(digits)
         raw_body = self.rfile.read(n)
         enc = (self.headers.get("Content-Encoding") or "").strip().lower()
         if API_ONLY and enc and enc != "identity":
@@ -1236,11 +1314,19 @@ class Handler(BaseHTTPRequestHandler):
                                                "type": "invalid_request_error"}})
 
         stream = bool(req.get("stream"))
+        cancel = threading.Event()
         if stream:
-            self._sse_start()
+            try:
+                self._sse_start()
+            except OSError:
+                self.close_connection = True
+                return
         try:
-            invoke = lambda: call_prism(model, system, user, effort)
-            text = self._call_with_heartbeat(invoke) if stream else invoke()
+            invoke = lambda: call_prism(model, system, user, effort, cancel=cancel)
+            text = self._call_with_heartbeat(invoke, cancel) if stream else invoke()
+        except ClientDisconnected:
+            self.close_connection = True
+            return
         except BusyError as e:
             if stream:
                 return self._stream_error(str(e), "prism_busy", is_resp)
@@ -1250,6 +1336,8 @@ class Handler(BaseHTTPRequestHandler):
                              % (time.strftime("%H:%M:%S"), model,
                                 len(system), len(user), str(e)[:300]))
             if stream:
+                if cancel.is_set():
+                    return
                 return self._stream_error(str(e), "prism_upstream", is_resp)
             return self._send(502, {"error": {"message": str(e), "type": "prism_upstream"}})
 
