@@ -283,7 +283,12 @@ def additional_tool_specs(items):
                     raise ClientInputError("tool name must be a non-empty string")
                 if ns and ns.startswith("mcp__"):
                     continue
-                params = t.get("parameters") or t.get("input_schema") or {}
+                if "parameters" in t:
+                    params = t["parameters"]
+                elif "input_schema" in t:
+                    params = t["input_schema"]
+                else:
+                    params = {}
                 if not isinstance(params, dict):
                     raise ClientInputError("tool parameters for %s must be an object" % name)
                 desc = t.get("description") or ""
@@ -309,7 +314,12 @@ def tool_specs(tools):
         name = f.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ClientInputError("tool name must be a non-empty string")
-        params = f.get("parameters") or f.get("input_schema") or {}
+        if "parameters" in f:
+            params = f["parameters"]
+        elif "input_schema" in f:
+            params = f["input_schema"]
+        else:
+            params = {}
         if not isinstance(params, dict):
             raise ClientInputError("tool parameters for %s must be an object" % name)
         encoded = json.dumps(params, ensure_ascii=False)
@@ -421,7 +431,10 @@ def _content_text(content, where="content"):
             raise ClientInputError("%s contains a non-object content part" % where)
         typ = part.get("type")
         if typ in (None, "text", "input_text", "output_text"):
-            out.append(part.get("text") or "")
+            if "text" not in part or not isinstance(part["text"], str):
+                raise ClientInputError(
+                    "%s text part must contain a string text field" % where)
+            out.append(part["text"])
             continue
         raise ClientInputError(
             "unsupported %s part type %r; Prism adapter is text-only" % (where, typ))
@@ -1024,7 +1037,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._passthrough(
                 self.rfile.read(int(self.headers.get("Content-Length") or 0)))
 
-        n = int(self.headers.get("Content-Length") or 0)
+        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        content_length = self.headers.get("Content-Length")
+        if API_ONLY and transfer_encoding:
+            return self._send(400, {"error": {
+                "message": "Transfer-Encoding is not supported in API-only mode",
+                "type": "invalid_request_error", "param": "Transfer-Encoding"}})
+        if API_ONLY and content_length is None:
+            return self._send(411, {"error": {
+                "message": "Content-Length is required in API-only mode",
+                "type": "invalid_request_error", "param": "Content-Length"}})
+        try:
+            n = int(content_length or 0)
+        except (TypeError, ValueError):
+            return self._send(400, {"error": {
+                "message": "Content-Length must be a non-negative integer",
+                "type": "invalid_request_error", "param": "Content-Length"}})
+        if n < 0:
+            return self._send(400, {"error": {
+                "message": "Content-Length must be a non-negative integer",
+                "type": "invalid_request_error", "param": "Content-Length"}})
         if n > MAX_BODY:
             return self._send(413, {"error": {"message": "request body too large",
                                                "type": "invalid_request_error"}})
@@ -1056,6 +1088,10 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(HERE, "last_request.json"), "w", encoding="utf-8") as fh:
                 json.dump(req, fh, ensure_ascii=False, indent=2)
 
+        if API_ONLY and ("model" not in req or req.get("model") is None):
+            return self._send(400, {"error": {
+                "message": "model is required in API-only mode",
+                "type": "invalid_request_error", "param": "model"}})
         requested = req.get("model", "prism-astra")
         if requested is None:
             requested = "prism-astra"
@@ -1116,11 +1152,14 @@ class Handler(BaseHTTPRequestHandler):
                 "message": "stream must be a boolean",
                 "type": "invalid_request_error", "param": "stream"}})
 
-        tools = req.get("tools") or []
-        if not isinstance(tools, list):
-            return self._send(400, {"error": {"message": "tools must be an array",
-                                               "type": "invalid_request_error",
-                                               "param": "tools"}})
+        if "tools" in req:
+            tools = req["tools"]
+            if not isinstance(tools, list):
+                return self._send(400, {"error": {"message": "tools must be an array",
+                                                   "type": "invalid_request_error",
+                                                   "param": "tools"}})
+        else:
+            tools = []
         if req.get("parallel_tool_calls") is True and tools:
             return self._send(400, {"error": {
                 "message": "parallel tool calls are not supported by the Prism adapter",
@@ -1130,7 +1169,8 @@ class Handler(BaseHTTPRequestHandler):
             if is_resp:
                 system, user = flatten_responses(req.get("input"), req.get("instructions"), tools)
             else:
-                system, user = flatten(req.get("messages") or [], tools)
+                messages = req["messages"] if "messages" in req else []
+                system, user = flatten(messages, tools)
         except ClientInputError as e:
             return self._send(400, {"error": {"message": str(e),
                                                "type": "invalid_request_error"}})
