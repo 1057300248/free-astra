@@ -144,7 +144,9 @@ Useful service settings:
 
 - `PRISM_QUEUE_TIMEOUT` — maximum wait for the single sandbox slot (default 15s).
 - `PRISM_SSE_HEARTBEAT` — seconds between SSE heartbeat comments (default 10s).
-- `PRISM_MAX_BODY` — maximum compressed/decompressed HTTP request size.
+- `PRISM_MAX_BODY` — maximum HTTP request body size. In `PRISM_API_ONLY=1`,
+  compressed request bodies are rejected before decompression to avoid decompression
+  bombs; keep compression disabled at this adapter boundary.
 - `PRISM_MAX_TOOL_SCHEMA` — maximum JSON size of one emulated tool schema.
 - `PRISM_API_KEY` — optional bearer token required by adapter API routes.
 - `PRISM_BIND` — bind address; defaults to loopback.
