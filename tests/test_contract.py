@@ -201,6 +201,51 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn(b"exactly one Content-Length", body)
 
+        status, _, body = self.raw_http(
+            base + b"Content-Length: 1_0\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertIn(b"non-negative", body)
+
+    def test_api_only_early_rejections_close_connections(self):
+        base = (
+            b"POST /v1/responses HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+        )
+
+        status, head, _ = self.raw_http(
+            base + b"Content-Length: %d\r\n\r\n" % (fa.MAX_BODY + 1))
+        self.assertEqual(status, 413)
+        self.assertIn(b"Connection: close", head)
+
+        fa.API_KEY = "secret"
+        status, head, _ = self.raw_http(
+            base + b"Content-Length: 2\r\n\r\n{}")
+        self.assertEqual(status, 401)
+        self.assertIn(b"Connection: close", head)
+        fa.API_KEY = ""
+
+        status, head, _ = self.raw_http(
+            b"POST /v1/embeddings HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 2\r\n\r\n{}")
+        self.assertEqual(status, 404)
+        self.assertIn(b"Connection: close", head)
+
+    def test_successful_requests_keep_connection_alive(self):
+        request = b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        with socket.create_connection(
+                ("127.0.0.1", self.server.server_port), timeout=3) as sock:
+            sock.sendall(request * 2)
+            data = b""
+            while data.count(b"HTTP/1.1 200") < 2:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        self.assertEqual(data.count(b"HTTP/1.1 200"), 2)
+
     def test_api_only_rejects_compressed_body_before_decompression(self):
         # The body does not need to be valid compressed data: API-only must reject
         # Content-Encoding before invoking any decompressor.
@@ -403,6 +448,16 @@ class AdapterContractTests(unittest.TestCase):
             fa._call_prism_locked(
                 "gpt-6-astra", "", "hello", "medium", 1, fa.time.time())
         self.assertEqual(calls, ["gpt-6-astra"])
+
+    def test_unknown_responses_item_type_is_rejected_in_api_only(self):
+        with self.assertRaises(fa.ClientInputError):
+            fa.flatten_responses([{"type": "reasoning", "summary": []}], None, [])
+
+    def test_unknown_responses_item_type_is_tolerated_outside_api_only(self):
+        fa.API_ONLY = False
+        _, user = fa.flatten_responses(
+            [{"type": "reasoning", "summary": []}, "hello"], None, [])
+        self.assertEqual(user, "[user]\nhello")
 
     def test_optional_adapter_api_key(self):
         fa.API_KEY = "secret"
