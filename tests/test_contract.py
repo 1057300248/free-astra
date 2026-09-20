@@ -239,6 +239,16 @@ class AdapterContractTests(unittest.TestCase):
             {"model": "prism-astra",
              "input": [{"type": "message", "role": "user",
                         "content": [{"type": "input_text", "text": 123}]}]},
+            {"model": "prism-astra", "input": "hello", "instructions": 0},
+            {"model": "prism-astra", "input": "hello", "background": 0},
+            {"model": "prism-astra", "input": "hello", "store": ""},
+            {"model": "prism-astra", "input": "hello",
+             "reasoning": {"effort": 0}},
+            {"model": "prism-astra", "input": "hello", "reasoning_effort": 0},
+            {"model": "prism-astra", "input": "hello", "text": ""},
+            {"model": "prism-astra", "input": "hello",
+             "text": {"format": ""}},
+            {"model": "prism-astra", "input": "hello", "parallel_tool_calls": ""},
         ]
         for payload in cases:
             with self.subTest(payload=payload):
@@ -265,6 +275,34 @@ class AdapterContractTests(unittest.TestCase):
                 parsed = json.loads(body)
                 self.assertEqual(parsed["error"]["param"], "model")
         self.assertEqual(called, [])
+
+    def test_api_only_requires_input_and_chat_messages(self):
+        cases = [
+            ("/v1/responses", {"model": "prism-astra"}, "input"),
+            ("/v1/responses", {"model": "prism-astra", "input": None}, "input"),
+            ("/v1/chat/completions", {"model": "prism-astra"}, "messages"),
+            ("/v1/chat/completions",
+             {"model": "prism-astra", "messages": None}, "messages"),
+        ]
+        for path, payload, param in cases:
+            with self.subTest(path=path, payload=payload):
+                status, _, body = self.request("POST", path, payload)
+                self.assertEqual(status, 400)
+                parsed = json.loads(body)
+                self.assertEqual(parsed["error"]["param"], param)
+
+    def test_chat_optional_field_types_are_validated(self):
+        cases = [
+            {"model": "prism-astra", "messages": [], "reasoning_effort": 0},
+            {"model": "prism-astra", "messages": [], "response_format": ""},
+            {"model": "prism-astra", "messages": [], "parallel_tool_calls": 0},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                status, _, body = self.request(
+                    "POST", "/v1/chat/completions", payload)
+                self.assertEqual(status, 400, body)
+                self.assertIn(b"invalid_request_error", body)
 
     def test_stream_emits_responses_lifecycle(self):
         fa.call_prism = lambda model, system, user, effort, retries=3: "hello"
