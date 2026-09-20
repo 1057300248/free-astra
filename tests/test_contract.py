@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import unittest
 import urllib.error
@@ -60,6 +61,22 @@ class AdapterContractTests(unittest.TestCase):
         return self.raw_request(
             method, path, data,
             {"content-type": "application/json", **(headers or {})})
+
+    def raw_http(self, request_bytes):
+        with socket.create_connection(
+                ("127.0.0.1", self.server.server_port), timeout=3) as sock:
+            sock.sendall(request_bytes)
+            chunks = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        raw = b"".join(chunks)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        status = int(status_line.split()[1])
+        return status, head, body
 
     def test_models_exposes_only_prism_aliases(self):
         status, _, body = self.request("GET", "/v1/models")
@@ -154,6 +171,36 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIn(b"authentication_error", body)
 
+    def test_api_only_rejects_unsafe_http_body_framing(self):
+        base = (
+            b"POST /v1/responses HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+        )
+
+        status, _, body = self.raw_http(
+            base
+            + b"Transfer-Encoding: chunked\r\n\r\n"
+            + b"2\r\n{}\r\n0\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertIn(b"Transfer-Encoding", body)
+
+        status, _, body = self.raw_http(base + b"\r\n")
+        self.assertEqual(status, 411)
+        self.assertIn(b"Content-Length", body)
+
+        status, _, body = self.raw_http(
+            base + b"Content-Length: -1\r\n\r\n")
+        self.assertEqual(status, 400)
+        self.assertIn(b"non-negative", body)
+
+        status, _, body = self.raw_http(
+            base
+            + b"Content-Length: 2\r\n"
+            + b"Content-Length: 2\r\n\r\n{}")
+        self.assertEqual(status, 400)
+        self.assertIn(b"exactly one Content-Length", body)
+
     def test_api_only_rejects_compressed_body_before_decompression(self):
         # The body does not need to be valid compressed data: API-only must reject
         # Content-Encoding before invoking any decompressor.
@@ -168,18 +215,56 @@ class AdapterContractTests(unittest.TestCase):
     def test_invalid_json_field_types_return_400(self):
         cases = [
             {"model": 123, "input": "hello"},
+            {"model": "", "input": "hello"},
             {"model": "prism-astra", "input": 123},
+            {"model": "prism-astra", "input": "hello", "tools": ""},
+            {"model": "prism-astra", "input": "hello", "tools": 0},
+            {"model": "prism-astra", "input": "hello", "tools": None},
             {"model": "prism-astra", "input": "hello", "tools": [123]},
             {"model": "prism-astra", "input": "hello",
              "tools": [{"type": "function", "name": 123, "parameters": {}}]},
             {"model": "prism-astra", "input": "hello",
              "tools": [{"type": "function", "function": "not-an-object"}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "function": {}}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "name": "x", "parameters": []}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "name": "x", "parameters": ""}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "name": "x", "parameters": None}]},
+            {"model": "prism-astra", "input": "hello",
+             "tools": [{"type": "function", "name": "x",
+                        "parameters": {}, "description": 0}]},
+            {"model": "prism-astra",
+             "input": [{"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": 123}]}]},
         ]
         for payload in cases:
             with self.subTest(payload=payload):
                 status, _, body = self.request("POST", "/v1/responses", payload)
                 self.assertEqual(status, 400, body)
                 self.assertIn(b"invalid_request_error", body)
+
+    def test_api_only_requires_explicit_non_null_model(self):
+        called = []
+
+        def fake(*args, **kwargs):
+            called.append(True)
+            return "should not run"
+
+        fa.call_prism = fake
+        for payload in (
+            {"input": "hello"},
+            {"model": None, "input": "hello"},
+        ):
+            with self.subTest(payload=payload):
+                status, _, body = self.request(
+                    "POST", "/v1/responses", payload)
+                self.assertEqual(status, 400)
+                parsed = json.loads(body)
+                self.assertEqual(parsed["error"]["param"], "model")
+        self.assertEqual(called, [])
 
     def test_stream_emits_responses_lifecycle(self):
         fa.call_prism = lambda model, system, user, effort, retries=3: "hello"
