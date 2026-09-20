@@ -14,7 +14,7 @@ Two behaviours the upstream forces on us, both handled here:
 
 Stdlib only, single file. See README.md for how the pieces fit.
 """
-import hmac, json, os, re, sys, time, threading, urllib.request, urllib.error
+import hmac, json, os, re, select, socket, sys, time, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = "https://prism.openai.com"
@@ -40,6 +40,7 @@ MAX_BODY = int(os.environ.get("PRISM_MAX_BODY", str(4 * 1024 * 1024)))
 BIND = os.environ.get("PRISM_BIND", "127.0.0.1")
 API_KEY = os.environ.get("PRISM_API_KEY", "")
 API_ONLY = os.environ.get("PRISM_API_ONLY", "").lower() in ("1", "true", "yes", "on")
+API_REFRESH = os.environ.get("PRISM_API_REFRESH", "").lower() in ("1", "true", "yes", "on")
 ALLOW_FALLBACK = os.environ.get("PRISM_ALLOW_MODEL_FALLBACK", "").lower() in ("1", "true", "yes", "on")
 KEEP_INSTRUCTIONS = os.environ.get("PRISM_KEEP_INSTRUCTIONS", "").lower() in ("1", "true", "yes", "on")
 CHATGPT_UPSTREAM = "https://chatgpt.com/backend-api/codex"
@@ -157,16 +158,25 @@ def unsupported(reason):
 _last_refresh = [0.0]
 
 
-def try_refresh(reason):
+def try_refresh(reason, cancel=None):
     """Stale cookies or a dead sandbox make every call fail. Re-run the capture
     script once rather than making the user notice and do it by hand."""
     if os.environ.get("PRISM_NO_AUTO_REFRESH"):
         return False
+    if API_ONLY and not API_REFRESH:
+        return False
     script = os.path.join(HERE, "scripts", "refresh-session.sh")
     if not os.path.exists(script):
         return False
+    _check_cancel(cancel)
     waited = _refresh_lock.locked()
-    with _refresh_lock:
+    refresh_deadline = time.time() + 30
+    while not _refresh_lock.acquire(timeout=0.25):
+        _check_cancel(cancel)
+        if time.time() > refresh_deadline:
+            return False
+    proc = None
+    try:
         if waited and time.time() - _last_refresh[0] < 180:
             return True                # someone just refreshed while we queued; use it
         if time.time() - _last_refresh[0] < 30:
@@ -175,18 +185,35 @@ def try_refresh(reason):
         sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "session looks stale (%s) - refreshing\n" % reason)
         try:
             import subprocess
-            r = subprocess.run(["bash", script], capture_output=True, timeout=300,
-                               env=dict(os.environ, PRISM_SESSION=SESSION_FILE))
-            if r.returncode != 0:
-                sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh failed: %s\n"
-                                 % (r.stderr or b"")[-300:].decode("utf-8", "replace"))
-                return False
+            proc = subprocess.Popen(["bash", script], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    env=dict(os.environ, PRISM_SESSION=SESSION_FILE))
         except Exception as e:
             sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh error: %s\n" % e)
+            return False
+        deadline = time.time() + 300
+        err = b""
+        while True:
+            _check_cancel(cancel)
+            try:
+                _, err = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() > deadline:
+                    sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh timed out\n")
+                    return False
+        if proc.returncode != 0:
+            sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "refresh failed: %s\n"
+                             % (err or b"")[-300:].decode("utf-8", "replace"))
             return False
         load_session()
         sys.stderr.write("[free-astra %s] " % time.strftime("%H:%M:%S") + "session refreshed\n")
         return True
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        _refresh_lock.release()
 _session = {"cookie": "", "sandbox_url": "", "sandbox_token": "",
             "project_id": None, "user_id": None, "upstream": None}
 
@@ -712,8 +739,14 @@ def _prism_attempt(inp, model, effort, deadline, retries, cancel=None):
 def call_prism(model, system, user, effort, retries=3, cancel=None):
     _check_cancel(cancel)
     waited = time.time()
-    if not _turn_lock.acquire(timeout=QUEUE_TIMEOUT):
-        raise BusyError("Prism sandbox is busy; retry later")
+    deadline = waited + QUEUE_TIMEOUT
+    while True:
+        _check_cancel(cancel)
+        left = deadline - time.time()
+        if left <= 0:
+            raise BusyError("Prism sandbox is busy; retry later")
+        if _turn_lock.acquire(timeout=min(0.25, left)):
+            break
     try:
         _check_cancel(cancel)
         return _call_prism_locked(model, system, user, effort, retries, waited, cancel)
@@ -755,7 +788,7 @@ def _call_prism_locked(model, system, user, effort, retries, queued_at, cancel=N
     if "turn_state is required" in (why or "") or unsupported(why):
         raise RuntimeError(why)                 # not a session problem
     _check_cancel(cancel)
-    if try_refresh(why):
+    if try_refresh(why, cancel):
         text, why = _prism_attempt(inp, model, effort, time.time() + budget, retries, cancel)
         if text is not None:
             return text
@@ -847,9 +880,19 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
 
-    def _call_with_heartbeat(self, fn, cancel):
-        if SSE_HEARTBEAT <= 0:
-            return fn()
+    def _client_gone(self):
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        if not readable:
+            return False
+        try:
+            return not self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return True
+
+    def _call_with_watch(self, fn, cancel, heartbeat):
         done = threading.Event()
         box = {}
 
@@ -862,12 +905,17 @@ class Handler(BaseHTTPRequestHandler):
                 done.set()
 
         threading.Thread(target=worker, daemon=True).start()
-        while not done.wait(SSE_HEARTBEAT):
-            try:
-                self._sse(b": ping\n\n")
-            except OSError:
+        wait = heartbeat if heartbeat > 0 else 0.5
+        while not done.wait(wait):
+            if heartbeat > 0:
+                try:
+                    self._sse(b": ping\n\n")
+                except OSError:
+                    cancel.set()
+                    raise ClientDisconnected("client disconnected during streaming")
+            elif self._client_gone():
                 cancel.set()
-                raise ClientDisconnected("client disconnected during streaming")
+                raise ClientDisconnected("client disconnected during request")
         if "error" in box:
             raise box["error"]
         return box.get("value")
@@ -1323,7 +1371,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
         try:
             invoke = lambda: call_prism(model, system, user, effort, cancel=cancel)
-            text = self._call_with_heartbeat(invoke, cancel) if stream else invoke()
+            text = self._call_with_watch(invoke, cancel,
+                                         SSE_HEARTBEAT if stream else 0)
         except ClientDisconnected:
             self.close_connection = True
             return

@@ -141,7 +141,9 @@ finishes and receive SSE heartbeat comments while Prism is polling. Responses AP
 streams emit the normal text/function argument lifecycle events. Unsupported
 features such as `previous_response_id`, stored/background responses, image/file
 input, structured output and parallel tool calls fail explicitly instead of being
-silently approximated.
+silently approximated. Disconnects are noticed for both streaming and non-streaming
+requests; the abandoned Prism turn is cancelled so the single sandbox is released
+at the next upstream stage instead of running to the full timeout.
 
 Useful service settings:
 
@@ -152,6 +154,9 @@ Useful service settings:
   bombs; keep compression disabled at this adapter boundary.
 - `PRISM_MAX_TOOL_SCHEMA` — maximum JSON size of one emulated tool schema.
 - `PRISM_API_KEY` — optional bearer token required by adapter API routes.
+- `PRISM_API_REFRESH` — API-only mode disables the bundled browser session refresh
+  by default; run an external session/account refresher, or set this to `1` to let
+  the adapter run `refresh-session.sh` itself.
 - `PRISM_BIND` — bind address; defaults to loopback.
 
 The adapter still cannot provide authoritative token usage: Prism does not expose

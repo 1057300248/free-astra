@@ -40,6 +40,7 @@ class AdapterContractTests(unittest.TestCase):
     def tearDown(self):
         fa.API_ONLY = True
         fa.API_KEY = ""
+        fa.API_REFRESH = False
         fa.SSE_HEARTBEAT = 0.01
         fa.ALLOW_FALLBACK = False
         fa.call_prism = self.originals["call_prism"]
@@ -465,7 +466,7 @@ class AdapterContractTests(unittest.TestCase):
             return None, "400 Unsupported assistant model"
 
         fa._prism_attempt = fake_attempt
-        fa.try_refresh = lambda reason: False
+        fa.try_refresh = lambda reason, cancel=None: False
         fa.ALLOW_FALLBACK = False
         with self.assertRaises(RuntimeError):
             fa._call_prism_locked(
@@ -557,6 +558,69 @@ class AdapterContractTests(unittest.TestCase):
             fa.time.sleep(0.05)
         self.assertTrue(seen["cancel"].is_set())
         release.set()
+
+    def test_non_stream_disconnect_cancels_prism_worker(self):
+        started = threading.Event()
+        release = threading.Event()
+        seen = {}
+
+        def slow(model, system, user, effort, retries=3, cancel=None):
+            seen["cancel"] = cancel
+            started.set()
+            release.wait(5)
+            return "late"
+
+        fa.call_prism = slow
+        body = json.dumps({"model": "prism-astra", "input": "hello"}).encode()
+        with socket.create_connection(
+                ("127.0.0.1", self.server.server_port), timeout=3) as sock:
+            sock.sendall(
+                b"POST /v1/responses HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body) + body)
+            self.assertTrue(started.wait(3))
+            sock.shutdown(socket.SHUT_WR)
+        deadline = fa.time.time() + 5
+        while not seen["cancel"].is_set() and fa.time.time() < deadline:
+            fa.time.sleep(0.05)
+        self.assertTrue(seen["cancel"].is_set())
+        release.set()
+
+    def test_cancelled_queue_wait_releases_promptly(self):
+        cancel = threading.Event()
+        self.assertTrue(fa._turn_lock.acquire(timeout=1))
+        finished = threading.Event()
+
+        def worker():
+            try:
+                fa.call_prism("gpt-6-astra", "", "hi", "low", retries=1,
+                              cancel=cancel)
+            except fa.CancelledError:
+                pass
+            finally:
+                finished.set()
+
+        try:
+            thread = threading.Thread(target=worker)
+            thread.start()
+            fa.time.sleep(0.1)
+            cancel.set()
+            self.assertTrue(finished.wait(3))
+        finally:
+            fa._turn_lock.release()
+
+    def test_api_only_disables_browser_auto_refresh(self):
+        self.assertTrue(fa.API_ONLY)
+        self.assertFalse(fa.try_refresh("stale session"))
+
+    def test_cancelled_refresh_never_spawns(self):
+        fa.API_ONLY = False
+        fa.API_REFRESH = True
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(fa.CancelledError):
+            fa.try_refresh("stale session", cancel=cancel)
 
     def test_optional_adapter_api_key(self):
         fa.API_KEY = "secret"
