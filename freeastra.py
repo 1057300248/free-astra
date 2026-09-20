@@ -291,7 +291,7 @@ def additional_tool_specs(items):
                     params = {}
                 if not isinstance(params, dict):
                     raise ClientInputError("tool parameters for %s must be an object" % name)
-                desc = t.get("description") or ""
+                desc = t["description"] if "description" in t else ""
                 if not isinstance(desc, str):
                     raise ClientInputError("tool description for %s must be a string" % name)
                 out.append((ns, name, params, desc.strip().split("\n")[0][:160]))
@@ -308,9 +308,9 @@ def tool_specs(tools):
             raise ClientInputError("tools must contain objects")
         if t.get("type") in ("namespace", "web_search"):
             continue
-        f = t.get("function") or t
-        if not isinstance(f, dict):
-            raise ClientInputError("tool function must be an object")
+        f = t["function"] if "function" in t else t
+        if not isinstance(f, dict) or not f:
+            raise ClientInputError("tool function must be a non-empty object")
         name = f.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ClientInputError("tool name must be a non-empty string")
@@ -327,7 +327,7 @@ def tool_specs(tools):
             raise ClientInputError(
                 "tool schema for %s is %d bytes; max is %d" %
                 (name, len(encoded), MAX_TOOL_SCHEMA))
-        desc = f.get("description") or ""
+        desc = f["description"] if "description" in f else ""
         if not isinstance(desc, str):
             raise ClientInputError("tool description for %s must be a string" % name)
         out.append((name, params, desc.strip().split("\n\n")[0][:1000]))
