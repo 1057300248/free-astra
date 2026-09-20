@@ -781,6 +781,9 @@ def acquire_turn(cancel=None):
         if left <= 0:
             raise BusyError("Prism sandbox is busy; retry later")
         if _turn_lock.acquire(timeout=min(0.25, left)):
+            if cancel is not None and cancel.is_set():
+                _turn_lock.release()
+                raise CancelledError("client disconnected; Prism turn abandoned")
             return waited
 
 
@@ -1469,7 +1472,10 @@ class Handler(BaseHTTPRequestHandler):
         queued_at = None
         if stream:
             try:
-                queued_at = acquire_turn(cancel)
+                queued_at = self._call_with_watch(lambda: acquire_turn(cancel), cancel, 0)
+            except ClientDisconnected:
+                self.close_connection = True
+                return
             except CancelledError:
                 self.close_connection = True
                 return

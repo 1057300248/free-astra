@@ -186,15 +186,17 @@ as a separate gateway channel with the same `prism-*` models:
 mkdir -p ~/.free-astra/accounts
 # capture each account's session as ~/.free-astra/accounts/<name>.json
 PRISM_ACCOUNTS_DIR=~/.free-astra/accounts PRISM_API_KEY=... scripts/account-pool.sh start
+scripts/account-pool.sh ports   # name -> port map, for gateway channel setup
 scripts/account-pool.sh status
 scripts/account-pool.sh stop
 ```
 
 Instances listen on consecutive ports starting at `PRISM_POOL_BASE_PORT` (default
-8319), with one log per account under the state directory. A busy instance answers
-before the stream starts with HTTP 503 `prism_busy`, so a gateway that retries 5xx
-(NewAPI retries 500-503 by default) spills the request to the next channel instead
-of failing it.
+8319), with one log per account under the state directory. Ports are persisted per
+account, so adding or removing one account does not move the ports the gateway is
+already configured for. A busy instance answers before the stream starts with HTTP
+503 `prism_busy`, so a gateway that retries 5xx (NewAPI retries 500-503 by default)
+spills the request to the next channel instead of failing it.
 
 Timeouts: keep `PRISM_TIMEOUT` (per turn, default 240s) below the gateway's
 streaming timeout (NewAPI `STREAMING_TIMEOUT`, default 300) and first-byte timeout

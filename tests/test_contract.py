@@ -639,6 +639,56 @@ class AdapterContractTests(unittest.TestCase):
         self.assertNotIn("text/event-stream", headers.get("Content-Type", ""))
         self.assertNotIn(b"event:", body)
 
+    def test_queue_wait_watches_client_disconnect(self):
+        saved_timeout = fa.QUEUE_TIMEOUT
+        saved_sse_start = fa.Handler._sse_start
+        saved_client_gone = fa.Handler._client_gone
+        original_gone = saved_client_gone
+        seen_gone = []
+
+        def spy(self):
+            gone = original_gone(self)
+            if gone:
+                seen_gone.append(True)
+            return gone
+
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
+            if queued_at is not None:
+                fa._turn_lock.release()
+            return "ok"
+
+        fa.QUEUE_TIMEOUT = 5
+        fa.Handler._sse_start = lambda self: None
+        fa.Handler._client_gone = spy
+        fa.call_prism = fake
+        self.assertTrue(fa._turn_lock.acquire(timeout=1))
+        try:
+            body = json.dumps({
+                "model": "prism-astra", "input": "hi", "stream": True,
+            }).encode()
+            sock = socket.create_connection(
+                ("127.0.0.1", self.server.server_port), timeout=3)
+            try:
+                sock.sendall(
+                    b"POST /v1/responses HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                fa.time.sleep(0.3)
+                sock.shutdown(socket.SHUT_WR)
+            finally:
+                sock.close()
+            deadline = fa.time.time() + 3
+            while not seen_gone and fa.time.time() < deadline:
+                fa.time.sleep(0.05)
+            observed = bool(seen_gone)
+        finally:
+            fa._turn_lock.release()
+            fa.QUEUE_TIMEOUT = saved_timeout
+            fa.Handler._sse_start = saved_sse_start
+            fa.Handler._client_gone = saved_client_gone
+        self.assertTrue(observed)
+
     def test_api_only_disables_browser_auto_refresh(self):
         self.assertTrue(fa.API_ONLY)
         before = fa._last_refresh[0]
