@@ -477,11 +477,12 @@ def flatten_responses(items, instructions, tools):
         raise ClientInputError("Responses input must be a string or an array")
 
     sys_parts, convo, env_parts = [], [], []
-    if instructions:
+    if instructions is not None:
         if not isinstance(instructions, str):
             raise ClientInputError("instructions must be a string")
-        sys_parts.append(instructions)
-        env_parts.append(instructions)
+        if instructions:
+            sys_parts.append(instructions)
+            env_parts.append(instructions)
 
     for it in items:
         if isinstance(it, str):
@@ -1118,16 +1119,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._passthrough(raw_body)
         model = ALIAS[requested]
 
+        if API_ONLY and is_resp and ("input" not in req or req.get("input") is None):
+            return self._send(400, {"error": {
+                "message": "input is required in API-only mode",
+                "type": "invalid_request_error", "param": "input"}})
+        if API_ONLY and is_chat and ("messages" not in req or req.get("messages") is None):
+            return self._send(400, {"error": {
+                "message": "messages is required in API-only mode",
+                "type": "invalid_request_error", "param": "messages"}})
+
         if is_resp:
             for param in ("previous_response_id", "conversation"):
                 if req.get(param):
                     return self._send(400, {"error": {
                         "message": "%s is not supported by the Prism adapter" % param,
                         "type": "unsupported_parameter", "param": param}})
-            if req.get("background"):
+            if "background" in req and not isinstance(req["background"], bool):
+                return self._send(400, {"error": {
+                    "message": "background must be a boolean",
+                    "type": "invalid_request_error", "param": "background"}})
+            if req.get("background") is True:
                 return self._send(400, {"error": {
                     "message": "background responses are not supported by the Prism adapter",
                     "type": "unsupported_parameter", "param": "background"}})
+            if "store" in req and not isinstance(req["store"], bool):
+                return self._send(400, {"error": {
+                    "message": "store must be a boolean",
+                    "type": "invalid_request_error", "param": "store"}})
             if req.get("store") is True:
                 return self._send(400, {"error": {
                     "message": "stored responses are not supported by the Prism adapter",
@@ -1138,22 +1156,54 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "reasoning must be an object",
                     "type": "invalid_request_error", "param": "reasoning"}})
             reasoning = reasoning or {}
-            effort = (reasoning.get("effort") or req.get("reasoning_effort") or effort)
-            text_cfg = req.get("text")
-            if isinstance(text_cfg, dict):
-                fmt = text_cfg.get("format")
-                if isinstance(fmt, dict) and fmt.get("type") not in (None, "text"):
+            if "effort" in reasoning:
+                value = reasoning["effort"]
+                if not isinstance(value, str) or not value:
+                    return self._send(400, {"error": {
+                        "message": "reasoning.effort must be a non-empty string",
+                        "type": "invalid_request_error", "param": "reasoning.effort"}})
+                effort = value
+            elif "reasoning_effort" in req:
+                value = req["reasoning_effort"]
+                if not isinstance(value, str) or not value:
+                    return self._send(400, {"error": {
+                        "message": "reasoning_effort must be a non-empty string",
+                        "type": "invalid_request_error", "param": "reasoning_effort"}})
+                effort = value
+            if "text" in req:
+                text_cfg = req["text"]
+                if not isinstance(text_cfg, dict):
+                    return self._send(400, {"error": {
+                        "message": "text must be an object",
+                        "type": "invalid_request_error", "param": "text"}})
+                if "format" in text_cfg:
+                    fmt = text_cfg["format"]
+                    if not isinstance(fmt, dict):
+                        return self._send(400, {"error": {
+                            "message": "text.format must be an object",
+                            "type": "invalid_request_error", "param": "text.format"}})
+                    if fmt.get("type") not in (None, "text"):
+                        return self._send(400, {"error": {
+                            "message": "structured output is not supported by the Prism adapter",
+                            "type": "unsupported_parameter", "param": "text.format"}})
+        else:
+            if "reasoning_effort" in req:
+                value = req["reasoning_effort"]
+                if not isinstance(value, str) or not value:
+                    return self._send(400, {"error": {
+                        "message": "reasoning_effort must be a non-empty string",
+                        "type": "invalid_request_error", "param": "reasoning_effort"}})
+                effort = value
+            if "response_format" in req:
+                response_format = req["response_format"]
+                if not isinstance(response_format, dict):
+                    return self._send(400, {"error": {
+                        "message": "response_format must be an object",
+                        "type": "invalid_request_error", "param": "response_format"}})
+                if response_format.get("type") not in (None, "text"):
                     return self._send(400, {"error": {
                         "message": "structured output is not supported by the Prism adapter",
-                        "type": "unsupported_parameter", "param": "text.format"}})
-        else:
-            effort = req.get("reasoning_effort") or effort
-            response_format = req.get("response_format")
-            if (isinstance(response_format, dict)
-                    and response_format.get("type") not in (None, "text")):
-                return self._send(400, {"error": {
-                    "message": "structured output is not supported by the Prism adapter",
-                    "type": "unsupported_parameter", "param": "response_format"}})
+                        "type": "unsupported_parameter", "param": "response_format"}})
 
         if "stream" in req and not isinstance(req.get("stream"), bool):
             return self._send(400, {"error": {
@@ -1168,6 +1218,11 @@ class Handler(BaseHTTPRequestHandler):
                                                    "param": "tools"}})
         else:
             tools = []
+        if ("parallel_tool_calls" in req
+                and not isinstance(req["parallel_tool_calls"], bool)):
+            return self._send(400, {"error": {
+                "message": "parallel_tool_calls must be a boolean",
+                "type": "invalid_request_error", "param": "parallel_tool_calls"}})
         if req.get("parallel_tool_calls") is True and tools:
             return self._send(400, {"error": {
                 "message": "parallel tool calls are not supported by the Prism adapter",
