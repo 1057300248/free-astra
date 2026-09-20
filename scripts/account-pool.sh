@@ -41,6 +41,14 @@ port_taken() {
     return 1
 }
 
+env_has() {
+    local line="$1" token="$2"
+    case "$line" in
+        "$token"|"$token "*|*" $token"|*" $token "*) return 0 ;;
+    esac
+    return 1
+}
+
 process_is_ours() {
     local pid="$1" port="${2:-}" session="$3" line
     if [ -r "/proc/$pid/environ" ]; then
@@ -51,19 +59,9 @@ process_is_ours() {
         return 0
     fi
     line="$(ps eww -p "$pid" -o command= 2>/dev/null || true)"
-    case "$line" in
-        *freeastra.py*) ;;
-        *) return 1 ;;
-    esac
-    case "$line" in
-        *"PRISM_SESSION=$session"*) ;;
-        *) return 1 ;;
-    esac
+    env_has "$line" "PRISM_SESSION=$session" || return 1
     if [ -n "$port" ]; then
-        case "$line" in
-            *"PRISM_PORT=$port"*) ;;
-            *) return 1 ;;
-        esac
+        env_has "$line" "PRISM_PORT=$port" || return 1
     fi
 }
 
