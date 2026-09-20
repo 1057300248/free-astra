@@ -59,6 +59,10 @@ process_is_ours() {
         return 0
     fi
     line="$(ps eww -p "$pid" -o command= 2>/dev/null || true)"
+    case "$line" in
+        *freeastra.py*) ;;
+        *) return 1 ;;
+    esac
     env_has "$line" "PRISM_SESSION=$session" || return 1
     if [ -n "$port" ]; then
         env_has "$line" "PRISM_PORT=$port" || return 1
