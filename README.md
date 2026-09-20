@@ -31,9 +31,10 @@ the Codex desktop app. Nothing is replaced.
 
 Prism's allowlist is not ours and it changes without notice: `gpt-6-astra` was
 accepted in the morning of 2026-09-17 and rejected by the afternoon with
-`400: Unsupported assistant model`. When that happens free-astra falls back to a
-model Prism still takes, logs the substitution and keeps your task running, rather
-than failing every request.
+`400: Unsupported assistant model`. Model identity is strict by default: a request
+for `prism-astra` now fails if Astra is unavailable instead of silently returning a
+different model. For the old local-Codex behaviour, explicitly set
+`PRISM_ALLOW_MODEL_FALLBACK=1`; do not enable that for metered/public API service.
 
 It is a real agent, not a chat box: it runs commands and edits files on your
 machine. Verified by handing it a Python file with two bugs, which it fixed and
@@ -113,6 +114,45 @@ python3 freeastra.py --demo  # offline self-check
 
 Effort comes from `PRISM_EFFORT` (`low`/`medium`/`high`) or a `model` suffix like
 `prism-astra:high`.
+
+## API / gateway mode
+
+The default remains the original local Codex front-door behaviour. For a dedicated
+upstream behind NewAPI or another gateway, run in fail-closed API mode:
+
+```bash
+PRISM_API_ONLY=1 \
+PRISM_API_KEY='replace-with-an-internal-secret' \
+PRISM_BIND=127.0.0.1 \
+python3 freeastra.py
+```
+
+Point the gateway at `http://127.0.0.1:8319/v1` (or a private network address if
+the adapter runs on another host). API mode only exposes the `prism-*` model
+aliases through `/v1/models`; unknown models and routes are rejected instead of
+being passed through to the Codex backend, so caller Authorization headers cannot
+leak across that boundary.
+
+For long-running HTTP requests, streaming connections are opened before Prism
+finishes and receive SSE heartbeat comments while Prism is polling. Responses API
+streams emit the normal text/function argument lifecycle events. Unsupported
+features such as `previous_response_id`, stored/background responses, image/file
+input, structured output and parallel tool calls fail explicitly instead of being
+silently approximated.
+
+Useful service settings:
+
+- `PRISM_QUEUE_TIMEOUT` — maximum wait for the single sandbox slot (default 15s).
+- `PRISM_SSE_HEARTBEAT` — seconds between SSE heartbeat comments (default 10s).
+- `PRISM_MAX_BODY` — maximum compressed/decompressed HTTP request size.
+- `PRISM_MAX_TOOL_SCHEMA` — maximum JSON size of one emulated tool schema.
+- `PRISM_API_KEY` — optional bearer token required by adapter API routes.
+- `PRISM_BIND` — bind address; defaults to loopback.
+
+The adapter still cannot provide authoritative token usage: Prism does not expose
+it, so `usage` remains zero. Do not use upstream usage for billing. A single Prism
+sandbox also remains effectively single-flight; scale with isolated account/sandbox
+workers rather than increasing `PRISM_CONCURRENCY` on one sandbox.
 
 ## Sessions expire
 
