@@ -1,3 +1,4 @@
+import http.client
 import json
 import socket
 import threading
@@ -689,6 +690,42 @@ class AdapterContractTests(unittest.TestCase):
         status, _, body = self.raw_request("HEAD", "/v1/models")
         self.assertEqual(status, 401)
         self.assertEqual(body, b"")
+
+    def test_head_error_paths_send_no_body(self):
+        for headers in (
+            b"Transfer-Encoding: chunked\r\n",
+            b"Content-Length: abc\r\n",
+            b"Content-Length: 2\r\n",
+        ):
+            with self.subTest(headers=headers):
+                status, _, body = self.raw_http(
+                    b"HEAD /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    + headers + b"\r\n")
+                self.assertEqual(status, 400)
+                self.assertEqual(body, b"")
+
+    def test_ipv6_loopback_bind_is_supported(self):
+        self.assertEqual(fa.IPv6ThreadingHTTPServer.address_family, fa.socket.AF_INET6)
+        try:
+            server = fa.IPv6ThreadingHTTPServer(("::1", 0), fa.Handler)
+        except OSError:
+            self.skipTest("IPv6 loopback is not available")
+        try:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("::1", server.server_port, timeout=3)
+            try:
+                connection.request("GET", "/v1/models")
+                response = connection.getresponse()
+                status = response.status
+                response.read()
+            finally:
+                connection.close()
+            server.shutdown()
+            thread.join(timeout=2)
+            self.assertEqual(status, 200)
+        finally:
+            server.server_close()
 
     def test_function_call_fields_are_type_checked(self):
         cases = [

@@ -162,10 +162,14 @@ Useful service settings:
   the adapter run `refresh-session.sh` itself.
 - `PRISM_KEEPALIVE` — seconds between keep-alive pings; defaults to `0` in API-only
   mode (and `600` otherwise). Set a positive value to keep a sandbox warm.
-- `PRISM_BIND` — bind address; defaults to loopback.
+- `PRISM_BIND` — bind address (IPv4, hostname, or IPv6 such as `::1`); defaults to
+  loopback.
 
 `/healthz` is a liveness check; `/readyz` reports the captured session fields only
 and does not probe Prism, so it cannot detect a stale cookie or a cold sandbox.
+HEAD mirrors the adapter's own routes with an empty body; in the default front-door
+mode it does not pass unknown routes upstream or merge the upstream model catalog,
+so use GET where that matters.
 
 The adapter still cannot provide authoritative token usage: Prism does not expose
 it, so `usage` remains zero. Do not use upstream usage for billing. A single Prism

@@ -831,6 +831,10 @@ def _call_prism_locked(model, system, user, effort, retries, queued_at, cancel=N
         "%s. Run %s/refresh-session.sh and retry." % (why, HERE))
 
 
+class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -856,29 +860,34 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _reject_unsolicited_body(self):
+        head = self.command == "HEAD"
         transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
         content_lengths = self.headers.get_all("Content-Length") or []
         if transfer_encodings:
             self._send(400, {"error": {
                 "message": "Transfer-Encoding is not supported for this method",
-                "type": "invalid_request_error", "param": "Transfer-Encoding"}}, close=True)
+                "type": "invalid_request_error", "param": "Transfer-Encoding"}},
+                close=True, body=not head)
             return True
         if len(content_lengths) > 1:
             self._send(400, {"error": {
                 "message": "exactly one Content-Length header is required",
-                "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
+                "type": "invalid_request_error", "param": "Content-Length"}},
+                close=True, body=not head)
             return True
         if content_lengths:
             value = content_lengths[0]
             if not (value.isascii() and value.isdigit()):
                 self._send(400, {"error": {
                     "message": "Content-Length must be a non-negative integer",
-                    "type": "invalid_request_error", "param": "Content-Length"}}, close=True)
+                    "type": "invalid_request_error", "param": "Content-Length"}},
+                    close=True, body=not head)
                 return True
             if (value.lstrip("0") or "0") != "0":
                 self._send(400, {"error": {
                     "message": "%s requests must not carry a body" % self.command,
-                    "type": "invalid_request_error"}}, close=True)
+                    "type": "invalid_request_error"}},
+                    close=True, body=not head)
                 return True
         return False
 
@@ -1636,4 +1645,6 @@ if __name__ == "__main__":
           % (BIND, PORT, ",".join(ALIAS.keys()), DEFAULT_EFFORT, API_ONLY))
     globals()["UPSTREAM"] = UPSTREAM
     threading.Thread(target=keepalive_loop, daemon=True).start()
-    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+    host = BIND.strip().strip("[]")
+    server_cls = IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
+    server_cls((host, PORT), Handler).serve_forever()
