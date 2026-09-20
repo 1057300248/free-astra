@@ -1037,23 +1037,31 @@ class Handler(BaseHTTPRequestHandler):
             return self._passthrough(
                 self.rfile.read(int(self.headers.get("Content-Length") or 0)))
 
-        transfer_encoding = (self.headers.get("Transfer-Encoding") or "").strip().lower()
-        content_length = self.headers.get("Content-Length")
+        transfer_encodings = self.headers.get_all("Transfer-Encoding") or []
+        content_lengths = self.headers.get_all("Content-Length") or []
+        transfer_encoding = ",".join(transfer_encodings).strip().lower()
+        content_length = content_lengths[0] if len(content_lengths) == 1 else None
         if API_ONLY and transfer_encoding:
+            self.close_connection = True
             return self._send(400, {"error": {
                 "message": "Transfer-Encoding is not supported in API-only mode",
                 "type": "invalid_request_error", "param": "Transfer-Encoding"}})
-        if API_ONLY and content_length is None:
-            return self._send(411, {"error": {
-                "message": "Content-Length is required in API-only mode",
+        if API_ONLY and len(content_lengths) != 1:
+            self.close_connection = True
+            return self._send(411 if not content_lengths else 400, {"error": {
+                "message": ("Content-Length is required in API-only mode"
+                            if not content_lengths
+                            else "exactly one Content-Length header is required"),
                 "type": "invalid_request_error", "param": "Content-Length"}})
         try:
             n = int(content_length or 0)
         except (TypeError, ValueError):
+            self.close_connection = True
             return self._send(400, {"error": {
                 "message": "Content-Length must be a non-negative integer",
                 "type": "invalid_request_error", "param": "Content-Length"}})
         if n < 0:
+            self.close_connection = True
             return self._send(400, {"error": {
                 "message": "Content-Length must be a non-negative integer",
                 "type": "invalid_request_error", "param": "Content-Length"}})
