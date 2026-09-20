@@ -23,6 +23,13 @@ sessions() {
     fi
 }
 
+valid_port() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
 port_taken() {
     local port="$1" except="$2" file name
     shopt -s nullglob
@@ -34,36 +41,78 @@ port_taken() {
     return 1
 }
 
+process_is_ours() {
+    local pid="$1" port="${2:-}" session="$3" line
+    if [ -r "/proc/$pid/environ" ]; then
+        tr '\0' '\n' <"/proc/$pid/environ" | grep -qxF "PRISM_SESSION=$session" || return 1
+        if [ -n "$port" ]; then
+            tr '\0' '\n' <"/proc/$pid/environ" | grep -qxF "PRISM_PORT=$port" || return 1
+        fi
+        return 0
+    fi
+    line="$(ps eww -p "$pid" -o command= 2>/dev/null || true)"
+    case "$line" in
+        *freeastra.py*) ;;
+        *) return 1 ;;
+    esac
+    case "$line" in
+        *"PRISM_SESSION=$session"*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$port" ]; then
+        case "$line" in
+            *"PRISM_PORT=$port"*) ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
+prune_orphans() {
+    local file name pid pidfile
+    [ -d "$ACCOUNTS_DIR" ] || return 0
+    shopt -s nullglob
+    for file in "$PID_DIR"/*.port "$PID_DIR"/*.pid; do
+        name="$(basename "$file")"
+        name="${name%.port}"
+        name="${name%.pid}"
+        [ -f "$ACCOUNTS_DIR/$name.json" ] && continue
+        pidfile="$PID_DIR/$name.pid"
+        if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            if kill -0 "$pid" 2>/dev/null \
+                    && process_is_ours "$pid" "" "$ACCOUNTS_DIR/$name.json"; then
+                continue
+            fi
+        fi
+        rm -f "$PID_DIR/$name.port" "$PID_DIR/$name.pid"
+    done
+}
+
 assign_port() {
-    local name="$1" port=""
+    local name="$1" port="" candidate
     mkdir -p "$PID_DIR"
     if [ -f "$PID_DIR/$name.port" ]; then
         port="$(cat "$PID_DIR/$name.port")"
+        if valid_port "$port" && ! port_taken "$port" "$name"; then
+            echo "$port"
+            return
+        fi
     fi
-    if [ -n "$port" ] && ! port_taken "$port" "$name"; then
-        echo "$port"
-        return
-    fi
-    port="$BASE_PORT"
-    while port_taken "$port" "$name"; do
-        port=$((port + 1))
+    candidate="$BASE_PORT"
+    while port_taken "$candidate" "$name"; do
+        candidate=$((candidate + 1))
     done
-    echo "$port" >"$PID_DIR/$name.port"
-    echo "$port"
-}
-
-process_is_ours() {
-    local pid="$1" port="$2" session="$3"
-    if [ -r "/proc/$pid/environ" ]; then
-        tr '\0' '\n' <"/proc/$pid/environ" | grep -qxF "PRISM_PORT=$port" || return 1
-        tr '\0' '\n' <"/proc/$pid/environ" | grep -qxF "PRISM_SESSION=$session" || return 1
-        return 0
+    if ! valid_port "$candidate"; then
+        echo "no usable port at or above PRISM_POOL_BASE_PORT=$BASE_PORT" >&2
+        exit 1
     fi
-    ps -p "$pid" -o command= 2>/dev/null | grep -q "freeastra.py"
+    echo "$candidate" >"$PID_DIR/$name.port"
+    echo "$candidate"
 }
 
 start() {
     mkdir -p "$LOG_DIR" "$PID_DIR"
+    prune_orphans
     local session name port pidfile pid
     local count=0
     while IFS= read -r session; do
@@ -100,6 +149,8 @@ start() {
 }
 
 stop() {
+    mkdir -p "$PID_DIR"
+    prune_orphans
     local pidfile name pid port session
     shopt -s nullglob
     for pidfile in "$PID_DIR"/*.pid; do
@@ -107,6 +158,7 @@ stop() {
         pid="$(cat "$pidfile")"
         port=""
         [ -f "$PID_DIR/$name.port" ] && port="$(cat "$PID_DIR/$name.port")"
+        valid_port "$port" || port=""
         session="$ACCOUNTS_DIR/$name.json"
         if kill -0 "$pid" 2>/dev/null; then
             if process_is_ours "$pid" "$port" "$session"; then
@@ -121,6 +173,8 @@ stop() {
 }
 
 status() {
+    mkdir -p "$PID_DIR"
+    prune_orphans
     local session name port
     while IFS= read -r session; do
         name="$(basename "$session" .json)"
@@ -134,6 +188,8 @@ status() {
 }
 
 ports() {
+    mkdir -p "$PID_DIR"
+    prune_orphans
     local session name port
     while IFS= read -r session; do
         name="$(basename "$session" .json)"
