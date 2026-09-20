@@ -771,7 +771,7 @@ def _prism_attempt(inp, model, effort, deadline, retries, cancel=None):
     return None, last or "no response"
 
 
-def call_prism(model, system, user, effort, retries=3, cancel=None):
+def acquire_turn(cancel=None):
     _check_cancel(cancel)
     waited = time.time()
     deadline = waited + QUEUE_TIMEOUT
@@ -781,10 +781,15 @@ def call_prism(model, system, user, effort, retries=3, cancel=None):
         if left <= 0:
             raise BusyError("Prism sandbox is busy; retry later")
         if _turn_lock.acquire(timeout=min(0.25, left)):
-            break
+            return waited
+
+
+def call_prism(model, system, user, effort, retries=3, cancel=None, queued_at=None):
+    if queued_at is None:
+        queued_at = acquire_turn(cancel)
     try:
         _check_cancel(cancel)
-        return _call_prism_locked(model, system, user, effort, retries, waited, cancel)
+        return _call_prism_locked(model, system, user, effort, retries, queued_at, cancel)
     finally:
         _turn_lock.release()
 
@@ -1461,14 +1466,24 @@ class Handler(BaseHTTPRequestHandler):
 
         stream = bool(req.get("stream"))
         cancel = threading.Event()
+        queued_at = None
         if stream:
+            try:
+                queued_at = acquire_turn(cancel)
+            except CancelledError:
+                self.close_connection = True
+                return
+            except BusyError as e:
+                return self._send(503, {"error": {"message": str(e), "type": "prism_busy"}})
             try:
                 self._sse_start()
             except OSError:
                 self.close_connection = True
+                _turn_lock.release()
                 return
         try:
-            invoke = lambda: call_prism(model, system, user, effort, cancel=cancel)
+            invoke = lambda: call_prism(model, system, user, effort, cancel=cancel,
+                                        queued_at=queued_at)
             text = self._call_with_watch(invoke, cancel,
                                          SSE_HEARTBEAT if stream else 0)
         except ClientDisconnected:

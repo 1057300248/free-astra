@@ -176,6 +176,36 @@ it, so `usage` remains zero. Do not use upstream usage for billing. A single Pri
 sandbox also remains effectively single-flight; scale with isolated account/sandbox
 workers rather than increasing `PRISM_CONCURRENCY` on one sandbox.
 
+### Scaling with multiple accounts
+
+One Prism account owns one sandbox and runs a single turn at a time. To raise
+concurrency, give each account its own adapter instance and register every instance
+as a separate gateway channel with the same `prism-*` models:
+
+```bash
+mkdir -p ~/.free-astra/accounts
+# capture each account's session as ~/.free-astra/accounts/<name>.json
+PRISM_ACCOUNTS_DIR=~/.free-astra/accounts PRISM_API_KEY=... scripts/account-pool.sh start
+scripts/account-pool.sh status
+scripts/account-pool.sh stop
+```
+
+Instances listen on consecutive ports starting at `PRISM_POOL_BASE_PORT` (default
+8319), with one log per account under the state directory. A busy instance answers
+before the stream starts with HTTP 503 `prism_busy`, so a gateway that retries 5xx
+(NewAPI retries 500-503 by default) spills the request to the next channel instead
+of failing it.
+
+Timeouts: keep `PRISM_TIMEOUT` (per turn, default 240s) below the gateway's
+streaming timeout (NewAPI `STREAMING_TIMEOUT`, default 300) and first-byte timeout
+(`RELAY_RESPONSE_HEADER_TIMEOUT`, default 1800). `PRISM_QUEUE_TIMEOUT` (default 15)
+is how long a request waits on one instance before it reports `prism_busy`.
+
+Billing: Prism exposes no token usage, so responses report `usage: 0` and a
+token-priced model would cost nothing. If the gateway must meter these models,
+assign them a fixed per-call price instead (NewAPI model price settings), for
+example `{"prism-astra": 0.01, "prism-sol": 0.01, "prism-terra": 0.01}`.
+
 ## Sessions expire
 
 Cookies last about 12 hours and the sandbox goes cold sooner. free-astra notices and

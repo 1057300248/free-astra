@@ -80,6 +80,10 @@ class AdapterContractTests(unittest.TestCase):
         status = int(status_line.split()[1])
         return status, head, body
 
+    def release_turn(self, queued_at):
+        if queued_at is not None:
+            fa._turn_lock.release()
+
     def test_models_exposes_only_prism_aliases(self):
         status, _, body = self.request("GET", "/v1/models")
         self.assertEqual(status, 200)
@@ -91,7 +95,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_responses_reads_nested_reasoning_effort(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3, cancel=None):
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen.update(model=model, effort=effort, user=user)
             return "ok"
 
@@ -111,7 +115,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_responses_string_input_is_not_split_into_characters(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3, cancel=None):
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["user"] = user
             return "ok"
 
@@ -375,7 +379,11 @@ class AdapterContractTests(unittest.TestCase):
                 self.assertIn(b"invalid_request_error", body)
 
     def test_stream_emits_responses_lifecycle(self):
-        fa.call_prism = lambda model, system, user, effort, retries=3, cancel=None: "hello"
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
+            self.release_turn(queued_at)
+            return "hello"
+
+        fa.call_prism = fake
         status, headers, body = self.request("POST", "/v1/responses", {
             "model": "prism-sol",
             "input": "hello",
@@ -399,9 +407,11 @@ class AdapterContractTests(unittest.TestCase):
         self.assertNotIn("[DONE]", text)
 
     def test_stream_emits_function_argument_events(self):
-        fa.call_prism = lambda model, system, user, effort, retries=3, cancel=None: (
-            '{"tool_call":{"name":"echo","arguments":{"value":"ok"}}}'
-        )
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
+            self.release_turn(queued_at)
+            return '{"tool_call":{"name":"echo","arguments":{"value":"ok"}}}'
+
+        fa.call_prism = fake
         status, _, body = self.request("POST", "/v1/responses", {
             "model": "prism-sol",
             "input": "use echo",
@@ -502,7 +512,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_structured_tool_output_is_serialized(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3, cancel=None):
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["user"] = user
             return "ok"
 
@@ -535,10 +545,11 @@ class AdapterContractTests(unittest.TestCase):
         release = threading.Event()
         seen = {}
 
-        def slow(model, system, user, effort, retries=3, cancel=None):
+        def slow(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["cancel"] = cancel
             started.set()
             release.wait(5)
+            self.release_turn(queued_at)
             return "late"
 
         fa.call_prism = slow
@@ -565,10 +576,11 @@ class AdapterContractTests(unittest.TestCase):
         release = threading.Event()
         seen = {}
 
-        def slow(model, system, user, effort, retries=3, cancel=None):
+        def slow(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["cancel"] = cancel
             started.set()
             release.wait(5)
+            self.release_turn(queued_at)
             return "late"
 
         fa.call_prism = slow
@@ -610,6 +622,22 @@ class AdapterContractTests(unittest.TestCase):
             self.assertTrue(finished.wait(3))
         finally:
             fa._turn_lock.release()
+
+    def test_stream_busy_returns_503_before_sse(self):
+        saved = fa.QUEUE_TIMEOUT
+        fa.QUEUE_TIMEOUT = 0.3
+        self.assertTrue(fa._turn_lock.acquire(timeout=1))
+        try:
+            status, headers, body = self.request("POST", "/v1/responses", {
+                "model": "prism-astra", "input": "hello", "stream": True,
+            })
+        finally:
+            fa._turn_lock.release()
+            fa.QUEUE_TIMEOUT = saved
+        self.assertEqual(status, 503)
+        self.assertIn(b"prism_busy", body)
+        self.assertNotIn("text/event-stream", headers.get("Content-Type", ""))
+        self.assertNotIn(b"event:", body)
 
     def test_api_only_disables_browser_auto_refresh(self):
         self.assertTrue(fa.API_ONLY)
@@ -743,7 +771,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_function_call_dict_arguments_are_serialized(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3, cancel=None):
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["user"] = user
             return "ok"
 
@@ -758,7 +786,7 @@ class AdapterContractTests(unittest.TestCase):
     def test_function_call_output_content_parts_are_joined(self):
         seen = {}
 
-        def fake(model, system, user, effort, retries=3, cancel=None):
+        def fake(model, system, user, effort, retries=3, cancel=None, queued_at=None):
             seen["user"] = user
             return "ok"
 
