@@ -256,26 +256,40 @@ def upstream_models():
 
 
 def additional_tool_specs(items):
-    """Codex ships its tools inside an `additional_tools` input item, grouped by
-    namespace. They are ordinary functions, so the classic emulation applies - the
-    only extra is carrying the namespace back on the function_call we emit."""
+    """Extract emulatable functions from Codex additional_tools items."""
     out = []
     for it in items or []:
         if not isinstance(it, dict) or it.get("type") != "additional_tools":
             continue
 
         def walk(ts, ns=None):
-            for t in ts or []:
+            if ts is None:
+                return
+            if not isinstance(ts, list):
+                raise ClientInputError("additional_tools.tools must be an array")
+            for t in ts:
+                if not isinstance(t, dict):
+                    raise ClientInputError("additional_tools must contain objects")
                 if t.get("type") == "namespace":
-                    walk(t.get("tools"), t.get("name"))
+                    name = t.get("name")
+                    if name is not None and not isinstance(name, str):
+                        raise ClientInputError("tool namespace name must be a string")
+                    walk(t.get("tools"), name)
+                    continue
+                if t.get("type") != "function":
                     continue
                 name = t.get("name")
-                if not name or t.get("type") != "function":
-                    continue                       # skip freeform/custom tools
+                if not isinstance(name, str) or not name.strip():
+                    raise ClientInputError("tool name must be a non-empty string")
                 if ns and ns.startswith("mcp__"):
-                    continue                       # MCP surface is too big to inline
-                desc = (t.get("description") or "").strip().split("\n")[0][:160]
-                out.append((ns, name, t.get("parameters") or t.get("input_schema") or {}, desc))
+                    continue
+                params = t.get("parameters") or t.get("input_schema") or {}
+                if not isinstance(params, dict):
+                    raise ClientInputError("tool parameters for %s must be an object" % name)
+                desc = t.get("description") or ""
+                if not isinstance(desc, str):
+                    raise ClientInputError("tool description for %s must be a string" % name)
+                out.append((ns, name, params, desc.strip().split("\n")[0][:160]))
 
         walk(it.get("tools"))
     return out
@@ -290,17 +304,23 @@ def tool_specs(tools):
         if t.get("type") in ("namespace", "web_search"):
             continue
         f = t.get("function") or t
+        if not isinstance(f, dict):
+            raise ClientInputError("tool function must be an object")
         name = f.get("name")
-        if not name:
-            continue
+        if not isinstance(name, str) or not name.strip():
+            raise ClientInputError("tool name must be a non-empty string")
         params = f.get("parameters") or f.get("input_schema") or {}
+        if not isinstance(params, dict):
+            raise ClientInputError("tool parameters for %s must be an object" % name)
         encoded = json.dumps(params, ensure_ascii=False)
         if len(encoded) > MAX_TOOL_SCHEMA:
             raise ClientInputError(
                 "tool schema for %s is %d bytes; max is %d" %
                 (name, len(encoded), MAX_TOOL_SCHEMA))
-        desc = (f.get("description") or "").strip().split("\n\n")[0][:1000]
-        out.append((name, params, desc))
+        desc = f.get("description") or ""
+        if not isinstance(desc, str):
+            raise ClientInputError("tool description for %s must be a string" % name)
+        out.append((name, params, desc.strip().split("\n\n")[0][:1000]))
     return out
 
 
@@ -410,8 +430,12 @@ def _content_text(content, where="content"):
 
 def flatten(messages, tools):
     """Chat-Completions shape."""
+    if messages is None:
+        messages = []
+    if not isinstance(messages, list):
+        raise ClientInputError("messages must be an array")
     sys_parts, convo = [], []
-    for m in messages or []:
+    for m in messages:
         if not isinstance(m, dict):
             raise ClientInputError("messages must contain objects")
         role = m.get("role")
@@ -432,13 +456,21 @@ def flatten(messages, tools):
 
 def flatten_responses(items, instructions, tools):
     """Responses shape - what Codex sends."""
+    if isinstance(items, str):
+        items = [items]
+    elif items is None:
+        items = []
+    elif not isinstance(items, list):
+        raise ClientInputError("Responses input must be a string or an array")
+
     sys_parts, convo, env_parts = [], [], []
     if instructions:
         if not isinstance(instructions, str):
             raise ClientInputError("instructions must be a string")
         sys_parts.append(instructions)
         env_parts.append(instructions)
-    for it in items or []:
+
+    for it in items:
         if isinstance(it, str):
             convo.append("[user]\n" + it)
             continue
@@ -689,9 +721,12 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[free-astra %s] %s\n"
                          % (time.strftime("%H:%M:%S"), fmt % a))
 
+    def _clean_path(self):
+        return self.path.split("?", 1)[0].rstrip("/") or "/"
+
     def _authorized(self):
-        clean = self.path.split("?")[0].rstrip("/")
-        if clean.endswith("/healthz") or clean.endswith("/readyz"):
+        clean = self._clean_path()
+        if clean in ("/healthz", "/readyz", "/v1/healthz", "/v1/readyz"):
             return True
         if not API_KEY:
             return True
@@ -763,23 +798,32 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        clean = self._clean_path()
+        allowed = {
+            "/v1/models", "/v1/responses", "/v1/chat/completions",
+            "/healthz", "/readyz", "/v1/healthz", "/v1/readyz",
+        }
+        if API_ONLY and clean not in allowed:
+            return self._send(404, {"error": {"message": "route is not served by the Prism adapter",
+                                               "type": "unsupported_route"}})
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
+
 
     def do_GET(self):
         if not self._authorized():
             return
-        clean = self.path.split("?")[0].rstrip("/")
-        if clean.endswith("/healthz"):
+        clean = self._clean_path()
+        if clean in ("/healthz", "/v1/healthz"):
             return self._send(200, {"status": "ok"})
-        if clean.endswith("/readyz"):
+        if clean in ("/readyz", "/v1/readyz"):
             ready = bool(_session.get("cookie") and _session.get("sandbox_token"))
             return self._send(200 if ready else 503,
                               {"status": "ready" if ready else "not_ready"})
-        if clean.endswith("/models"):
+        if clean == "/v1/models":
             mf = MANIFEST
             if "client_version=" in self.path and os.path.exists(mf) and not API_ONLY:
                 with open(mf, encoding="utf-8") as fh:
@@ -797,9 +841,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"object": "list", "data": [
                 {"id": m, "object": "model", "created": 0, "owned_by": "prism"}
                 for m in ids]})
-        if clean.endswith("/responses"):
+        if clean == "/v1/responses":
             return self._send(426, {"error": "websocket transport not supported"})
         self._passthrough(method="GET")
+
 
     # headers that describe OUR hop, not the payload, so they must not be copied
     HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer",
@@ -915,7 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                     "delta": args[i:i + 600]})
             ev("response.function_call_arguments.done",
                {"response_id": rid, "item_id": item["id"], "output_index": 0,
-                "arguments": args})
+                "name": item["name"], "arguments": args})
         else:
             pending = dict(item, status="in_progress",
                            content=[{"type": "output_text", "text": "", "annotations": []}])
@@ -969,9 +1014,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return
-        clean = self.path.split("?")[0].rstrip("/")
-        is_resp = clean.endswith("/responses")
-        is_chat = clean.endswith("/chat/completions")
+        clean = self._clean_path()
+        is_resp = clean == "/v1/responses"
+        is_chat = clean == "/v1/chat/completions"
         if not is_resp and not is_chat:
             if API_ONLY:
                 return self._send(404, {"error": {"message": "route is not served by the Prism adapter",
@@ -984,9 +1029,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(413, {"error": {"message": "request body too large",
                                                "type": "invalid_request_error"}})
         raw_body = self.rfile.read(n)
-        enc = (self.headers.get("Content-Encoding") or "").lower()
+        enc = (self.headers.get("Content-Encoding") or "").strip().lower()
+        if API_ONLY and enc and enc != "identity":
+            return self._send(415, {"error": {
+                "message": "compressed request bodies are disabled in API-only mode",
+                "type": "unsupported_media_type",
+                "param": "Content-Encoding"}})
         try:
-            body = decompress(raw_body, enc) if enc else raw_body
+            body = decompress(raw_body, enc) if enc and enc != "identity" else raw_body
         except Exception as e:
             return self._send(400, {"error": {"message": "request decompression failed: %s" % e,
                                                "type": "invalid_request_error"}})
@@ -1006,7 +1056,13 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(HERE, "last_request.json"), "w", encoding="utf-8") as fh:
                 json.dump(req, fh, ensure_ascii=False, indent=2)
 
-        requested = req.get("model") or "prism-astra"
+        requested = req.get("model", "prism-astra")
+        if requested is None:
+            requested = "prism-astra"
+        if not isinstance(requested, str) or not requested:
+            return self._send(400, {"error": {
+                "message": "model must be a non-empty string",
+                "type": "invalid_request_error", "param": "model"}})
         effort = DEFAULT_EFFORT
         if ":" in requested:
             requested, effort = requested.rsplit(":", 1)
@@ -1032,9 +1088,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": {
                     "message": "stored responses are not supported by the Prism adapter",
                     "type": "unsupported_parameter", "param": "store"}})
-            reasoning = req.get("reasoning") or {}
-            effort = ((reasoning.get("effort") if isinstance(reasoning, dict) else None)
-                      or req.get("reasoning_effort") or effort)
+            reasoning = req.get("reasoning")
+            if reasoning is not None and not isinstance(reasoning, dict):
+                return self._send(400, {"error": {
+                    "message": "reasoning must be an object",
+                    "type": "invalid_request_error", "param": "reasoning"}})
+            reasoning = reasoning or {}
+            effort = (reasoning.get("effort") or req.get("reasoning_effort") or effort)
             text_cfg = req.get("text")
             if isinstance(text_cfg, dict):
                 fmt = text_cfg.get("format")
@@ -1050,6 +1110,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": {
                     "message": "structured output is not supported by the Prism adapter",
                     "type": "unsupported_parameter", "param": "response_format"}})
+
+        if "stream" in req and not isinstance(req.get("stream"), bool):
+            return self._send(400, {"error": {
+                "message": "stream must be a boolean",
+                "type": "invalid_request_error", "param": "stream"}})
 
         tools = req.get("tools") or []
         if not isinstance(tools, list):
