@@ -31,9 +31,10 @@ the Codex desktop app. Nothing is replaced.
 
 Prism's allowlist is not ours and it changes without notice: `gpt-6-astra` was
 accepted in the morning of 2026-09-17 and rejected by the afternoon with
-`400: Unsupported assistant model`. When that happens free-astra falls back to a
-model Prism still takes, logs the substitution and keeps your task running, rather
-than failing every request.
+`400: Unsupported assistant model`. Model identity is strict by default: a request
+for `prism-astra` now fails if Astra is unavailable instead of silently returning a
+different model. For the old local-Codex behaviour, explicitly set
+`PRISM_ALLOW_MODEL_FALLBACK=1`; do not enable that for metered/public API service.
 
 It is a real agent, not a chat box: it runs commands and edits files on your
 machine. Verified by handing it a Python file with two bugs, which it fixed and
@@ -113,6 +114,101 @@ python3 freeastra.py --demo  # offline self-check
 
 Effort comes from `PRISM_EFFORT` (`low`/`medium`/`high`) or a `model` suffix like
 `prism-astra:high`.
+
+## API / gateway mode
+
+The default remains the original local Codex front-door behaviour. For a dedicated
+upstream behind NewAPI or another gateway, run in fail-closed API mode:
+
+```bash
+PRISM_API_ONLY=1 \
+PRISM_API_KEY='replace-with-an-internal-secret' \
+PRISM_BIND=127.0.0.1 \
+python3 freeastra.py
+```
+
+Point the gateway at `http://127.0.0.1:8319/v1` (or a private network address if
+the adapter runs on another host). API mode only exposes the `prism-*` model
+aliases through `/v1/models`; unknown models and routes are rejected instead of
+being passed through to the Codex backend, so caller Authorization headers cannot
+leak across that boundary. API-only requests must use normal Content-Length framing
+(no `Transfer-Encoding: chunked`), and must provide an explicit non-null `model`.
+Responses requests must include `input`; Chat Completions requests must include
+`messages`. Without `PRISM_API_KEY`, API mode only accepts a loopback `PRISM_BIND`;
+it refuses to start on a non-loopback address unless `PRISM_ALLOW_INSECURE=1`.
+
+For long-running HTTP requests, streaming connections are opened before Prism
+finishes and receive SSE heartbeat comments while Prism is polling. Responses API
+streams emit the normal text/function argument lifecycle events. Unsupported
+features such as `previous_response_id`, stored/background responses, image/file
+input, structured output and parallel tool calls fail explicitly instead of being
+silently approximated. Disconnects are noticed for both streaming and non-streaming
+requests; the abandoned Prism turn is cancelled so the single sandbox is released
+at the next upstream stage instead of running to the full timeout.
+
+Useful service settings:
+
+- `PRISM_QUEUE_TIMEOUT` — maximum wait for the single sandbox slot (default 15s).
+- `PRISM_SSE_HEARTBEAT` — seconds between SSE heartbeat comments (default 10s).
+- `PRISM_MAX_BODY` — maximum HTTP request body size. In `PRISM_API_ONLY=1`,
+  compressed request bodies are rejected before decompression to avoid decompression
+  bombs; keep compression disabled at this adapter boundary.
+- `PRISM_MAX_TOOL_SCHEMA` — maximum JSON size of one emulated tool schema.
+- `PRISM_API_KEY` — optional bearer token required by adapter API routes.
+- `PRISM_ALLOW_INSECURE` — allow API-only serving without a key on a non-loopback
+  bind; do not set this on an untrusted network.
+- `PRISM_API_REFRESH` — API-only mode disables the bundled browser session refresh
+  by default; run an external session/account refresher, or set this to `1` to let
+  the adapter run `refresh-session.sh` itself.
+- `PRISM_KEEPALIVE` — seconds between keep-alive pings; defaults to `0` in API-only
+  mode (and `600` otherwise). Set a positive value to keep a sandbox warm.
+- `PRISM_BIND` — bind address (IPv4, hostname, or IPv6 such as `::1`); defaults to
+  loopback.
+
+`/healthz` is a liveness check; `/readyz` reports the captured session fields only
+and does not probe Prism, so it cannot detect a stale cookie or a cold sandbox.
+HEAD mirrors the adapter's own routes with an empty body; in the default front-door
+mode it does not pass unknown routes upstream or merge the upstream model catalog,
+so use GET where that matters.
+
+The adapter still cannot provide authoritative token usage: Prism does not expose
+it, so `usage` remains zero. Do not use upstream usage for billing. A single Prism
+sandbox also remains effectively single-flight; scale with isolated account/sandbox
+workers rather than increasing `PRISM_CONCURRENCY` on one sandbox.
+
+### Scaling with multiple accounts
+
+One Prism account owns one sandbox and runs a single turn at a time. To raise
+concurrency, give each account its own adapter instance and register every instance
+as a separate gateway channel with the same `prism-*` models:
+
+```bash
+mkdir -p ~/.free-astra/accounts
+# capture each account's session as ~/.free-astra/accounts/<name>.json
+PRISM_ACCOUNTS_DIR=~/.free-astra/accounts PRISM_API_KEY=... scripts/account-pool.sh start
+scripts/account-pool.sh ports   # name -> port map, for gateway channel setup
+scripts/account-pool.sh status
+scripts/account-pool.sh stop
+```
+
+Instances listen on consecutive ports starting at `PRISM_POOL_BASE_PORT` (default
+8319), with one log per account under the state directory. Ports are persisted per
+account, so adding or removing one account does not move the ports the gateway is
+already configured for; metadata for accounts whose session file is gone is cleaned
+up on the next run and its port becomes available again. A busy instance answers
+before the stream starts with HTTP 503 `prism_busy`, so a gateway that retries 5xx
+(NewAPI retries 500-503 by default) spills the request to the next channel instead
+of failing it.
+
+Timeouts: keep `PRISM_TIMEOUT` (per turn, default 240s) below the gateway's
+streaming timeout (NewAPI `STREAMING_TIMEOUT`, default 300) and first-byte timeout
+(`RELAY_RESPONSE_HEADER_TIMEOUT`, default 1800). `PRISM_QUEUE_TIMEOUT` (default 15)
+is how long a request waits on one instance before it reports `prism_busy`.
+
+Billing: Prism exposes no token usage, so responses report `usage: 0` and a
+token-priced model would cost nothing. If the gateway must meter these models,
+assign them a fixed per-call price instead (NewAPI model price settings), for
+example `{"prism-astra": 0.01, "prism-sol": 0.01, "prism-terra": 0.01}`.
 
 ## Sessions expire
 
